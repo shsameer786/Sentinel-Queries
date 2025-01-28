@@ -1,0 +1,123 @@
+//=============================================================================
+// Rule Name: Suspicious Mixed Authentication Pattern Detection
+// Version: 1.0
+// Author: Sameer P Sheik
+// SEVERITY: Critical
+//
+// MITRE ATT&CK Mapping:
+// - Primary Technique: T1078.002 - Valid Accounts: Domain Accounts
+//   Description: Adversaries may use compromised domain accounts to bypass access controls
+// - Additional Techniques:
+//   * T1550.002 - Use Alternate Authentication Material: Pass the Hash
+//   * T1021.001 - Remote Services: Remote Desktop Protocol
+//   * T1110 - Brute Force
+//
+// Rule Description:
+// Detects suspicious authentication patterns indicating potential account compromise,
+// focusing on mixed authentication methods, multiple source IPs, and high-frequency logons
+//
+// OOB Analytics Validation:
+// 1. Microsoft Security Alert - "Multiple authentication failures followed by successful authentication"
+//    Complementarity: This custom rule extends OOB by adding:
+//    - Mixed authentication method detection (NTLM + Negotiate)
+//    - Source IP correlation (Internal + External)
+//    - Connection type analysis (Network + Remote Interactive)
+//
+// 2. Microsoft Security Alert - "Suspicious authentication activity"
+//    Complementarity: This rule provides additional context:
+//    - Authentication security level assessment
+//    - More granular risk scoring
+//    - Detailed connection type analysis
+//
+// 3. Microsoft Security Alert - "Multiple failed logons followed by successful logon"
+//    Complementarity: This rule focuses on successful logons with suspicious patterns
+//    rather than failed attempts, providing complementary coverage
+//
+// Risk Factors:
+// - Use of less secure authentication protocols (NTLM)
+// - Multiple source IPs (internal and external)
+// - High frequency of logons
+// - Mixed authentication methods
+//
+// False Positive Scenarios:
+// 1. IT admins performing system maintenance
+// 2. Applications using multiple authentication methods
+// 3. Users with legitimate internal and remote access needs
+//
+// Response Actions:
+// 1. Verify if the user typically requires remote access
+// 2. Check if the external IP is from approved location
+// 3. Investigate use of NTLM authentication
+// 4. Review user's normal authentication patterns
+//=============================================================================
+
+SecurityEvent
+| where TimeGenerated > ago(90d)
+| where EventID == 4624
+| where AccountType == "User"
+| where LogonType in (3, 10)
+| extend 
+    AuthStatus = case(
+        AuthenticationPackageName == "NTLM", "Less Secure",
+        AuthenticationPackageName == "Negotiate", "Standard",
+        "Unknown"
+    ),
+    ConnectionType = case(
+        LogonType == 3, "Network",
+        LogonType == 10, "Remote Interactive",
+        "Other"
+    ),
+    SourceIPType = case(
+        IpAddress == "0.0.0.0", "Internal",
+        IpAddress == "127.0.0.1", "Localhost",
+        IpAddress == "::1", "Localhost IPv6",
+        "External"
+    )
+| summarize 
+    LogonCount = count(),
+    LogonTypeList = make_set(LogonType),
+    IpAddresses = make_set(IpAddress),
+    IpAddressTypes = make_set(SourceIPType),
+    AuthPackages = make_set(AuthenticationPackageName),
+    AuthSecurityLevels = make_set(AuthStatus),
+    LogonProcesses = make_set(LogonProcessName),
+    ConnectionTypes = make_set(ConnectionType),
+    FirstLogon = min(TimeGenerated),
+    LastLogon = max(TimeGenerated)
+    by Account, Computer
+| project 
+    TimeGenerated = LastLogon,
+    Account,
+    Computer,
+    LogonCount,
+    LogonTypes = LogonTypeList,
+    AuthenticationMethods = AuthPackages,
+    SecurityLevels = AuthSecurityLevels,
+    ConnectionTypes,
+    SourceIPs = IpAddresses,
+    SourceIPTypes = IpAddressTypes,
+    MinutesBetweenFirstAndLast = datetime_diff('minute', LastLogon, FirstLogon),
+    LogonsPerMinute = 1.0 * LogonCount / case(datetime_diff('minute', LastLogon, FirstLogon) == 0, 1, datetime_diff('minute', LastLogon, FirstLogon))
+| where 
+    LogonCount >= 5 and
+    MinutesBetweenFirstAndLast <= 60 and
+    array_length(LogonTypes) > 1
+| extend 
+    RiskLevel = case(
+        array_length(SourceIPs) > 1 and AuthenticationMethods has "NTLM", "Critical",
+        LogonCount >= 8, "High",
+        LogonCount >= 5, "Medium",
+        "Low"
+    ),
+    AlertName = "Suspicious Authentication Pattern",
+    TechniqueId = "T1078.002",
+    TechniqueName = "Valid Accounts: Domain Accounts",
+    DetailedDescription = strcat(
+        "High-risk authentication pattern detected:\n",
+        "- Account: ", Account, "\n",
+        "- Authentication Methods: ", array_strcat(AuthenticationMethods, ", "), "\n",
+        "- Connection Types: ", array_strcat(ConnectionTypes, ", "), "\n",
+        "- Security Levels: ", array_strcat(SecurityLevels, ", "), "\n",
+        "- Source IP Types: ", array_strcat(SourceIPTypes, ", "), "\n",
+        "- Frequency: ", LogonCount, " logons in ", MinutesBetweenFirstAndLast, " minutes"
+    )

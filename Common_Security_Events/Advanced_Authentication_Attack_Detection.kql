@@ -1,0 +1,212 @@
+//=====================================
+// Rule Name: Advanced Authentication Attack Detection
+// Version: 1.0
+// Author: Sameer P Sheik
+//
+// SEVERITY LEVELS:
+// - Critical (90-100): Immediate response required, high confidence of attack
+// - High (70-89): Urgent investigation needed, strong indicators of attack
+// - Medium (60-69): Investigation required, moderate confidence
+//
+// MITRE ATT&CK MAPPING:
+// Primary Techniques:
+// - T1110.001 (Password Guessing)
+//   Description: Adversaries attempting to guess passwords for valid accounts
+//   Used For: Brute force detection pattern
+//
+// - T1110.003 (Password Spraying) 
+//   Description: Adversaries attempting single passwords against multiple accounts
+//   Used For: Password spray detection pattern
+//
+// - T1110.004 (Credential Stuffing)
+//   Description: Adversaries attempting to gain access using stolen credentials
+//   Used For: Multi-vector attack detection
+//
+// - T1078.002 (Valid Accounts: Domain Accounts)
+//   Description: Adversaries leveraging compromised domain accounts
+//   Used For: Privileged account targeting detection
+//
+// Sub-techniques:
+// - T1021.001 (Remote Services: Remote Desktop Protocol)
+//   Used For: Remote logon pattern detection
+//
+// VALIDATION AGAINST OOB ANALYTICS:
+// 1. Microsoft Security Alert "Multiple failed logon attempts" 
+//    Complementarity:
+//    - Adds privileged account targeting detection
+//    - Includes attack velocity metrics
+//    - Provides risk-based scoring
+//    - Enhanced investigation guidance
+//
+// 2. Microsoft Alert "Account authentication attempts" 
+//    Complementarity:
+//    - Adds pattern recognition (spray vs brute force)
+//    - Includes temporal analysis
+//    - Provides automated response guidance
+//    - Enhanced context for investigation
+//
+// 3. Microsoft Alert "Multiple authentication failures followed by success"
+//    Complementarity:
+//    - Adds privileged account focus
+//    - Enhanced attack pattern recognition
+//    - Automated severity assignment
+//    - Detailed remediation steps
+//
+// RULE TUNING GUIDANCE:
+// - Adjust AttemptsPerMinute threshold based on environment
+// - Modify UniqueAccounts threshold for password spray detection
+// - Tune RiskScore weights based on organizational priorities
+// - Update privileged account detection patterns
+//
+// FALSE POSITIVE SCENARIOS:
+// 1. Password expiration events causing multiple failures
+// 2. Service account misconfiguration
+// 3. Network connectivity issues
+// 4. Legitimate help desk activities
+//
+// INCIDENT RESPONSE STEPS:
+// 1. Critical Alerts:
+//    - Immediate account lockout
+//    - Source IP blocking
+//    - Incident ticket creation
+//
+// 2. High Alerts:
+//    - Account review
+//    - Traffic analysis
+//    - Security team notification
+//
+// 3. Medium Alerts:
+//    - Monitor for escalation
+//    - Log review
+//    - Pattern analysis
+//=====================================
+
+SecurityEvent
+| where TimeGenerated between(datetime(2025-01-17T04:03:00Z)..datetime(2025-01-17T08:44:57Z))
+| where EventID in (4625, 4771, 4776)
+| extend 
+    SourceIP = IpAddress,
+    TargetAccount = tolower(Account),
+    LogonTypeDesc = case(
+        LogonType == 2, "Interactive",
+        LogonType == 3, "Network",
+        LogonType == 4, "Batch",
+        LogonType == 5, "Service",
+        LogonType == 7, "Unlock",
+        LogonType == 8, "NetworkCleartext",
+        LogonType == 10, "RemoteInteractive",
+        strcat("Other:", LogonType)
+    ),
+    IsPrivilegedAccount = Account contains "admin" or Account contains "svc"
+| summarize 
+    FailedAttempts = count(),
+    UniqueAccounts = dcount(TargetAccount),
+    AccountList = make_set(TargetAccount),
+    LogonTypes = make_set(LogonTypeDesc),
+    EventIDs = make_set(EventID),
+    PrivilegedTargets = countif(IsPrivilegedAccount == true),
+    FirstAttempt = min(TimeGenerated),
+    LastAttempt = max(TimeGenerated)
+    by Computer, SourceIP
+| project
+    TimeGenerated = LastAttempt,
+    Computer,
+    SourceIP,
+    FailedAttempts,
+    UniqueAccounts,
+    AffectedAccounts = AccountList,
+    LogonTypes,
+    EventTypes = EventIDs,
+    PrivilegedTargets,
+    TimePeriod = datetime_diff('minute', LastAttempt, FirstAttempt)
+| extend 
+    AttemptsPerMinute = round(1.0 * FailedAttempts / (TimePeriod + 1), 2),
+    IsPasswordSpray = UniqueAccounts >= 2,
+    IsBruteForce = FailedAttempts >= 5,
+    HasPrivilegedTargets = PrivilegedTargets > 0
+| extend 
+    AttackPattern = case(
+        IsPasswordSpray and IsBruteForce and HasPrivilegedTargets, "Sophisticated Multi-Vector Attack",
+        IsPasswordSpray and HasPrivilegedTargets, "Privileged Account Password Spray",
+        IsBruteForce and HasPrivilegedTargets, "Privileged Account Brute Force",
+        IsPasswordSpray and IsBruteForce, "Combined Spray and Brute Force",
+        IsPasswordSpray, "Password Spray Attack",
+        IsBruteForce, "Brute Force Attack",
+        "Suspicious Authentication Activity"
+    )
+| extend 
+    RiskScore = case(
+        HasPrivilegedTargets and AttemptsPerMinute >= 1, 100,
+        HasPrivilegedTargets, 90,
+        IsPasswordSpray and IsBruteForce, 85,
+        AttemptsPerMinute >= 2, 80,
+        IsPasswordSpray and UniqueAccounts >= 5, 75,
+        IsBruteForce and FailedAttempts >= 20, 70,
+        IsPasswordSpray, 65,
+        IsBruteForce, 60,
+        50
+    )
+| extend 
+    RiskLevel = case(
+        RiskScore >= 90, "Critical",
+        RiskScore >= 70, "High",
+        RiskScore >= 60, "Medium",
+        "Low"
+    )
+| extend InvestigationSteps = case(
+    RiskLevel == "Critical", strcat(
+        "IMMEDIATE ACTIONS REQUIRED:\n",
+        "1. ISOLATE affected systems: ", Computer, "\n",
+        "2. BLOCK source IP: ", SourceIP, "\n",
+        "3. DISABLE compromised accounts\n",
+        "4. ENABLE MFA for all accounts\n\n",
+        "Investigation Steps:\n",
+        "1. Review successful logons from this IP\n",
+        "2. Check for post-compromise activity\n",
+        "3. Verify account permissions\n",
+        "4. Review authentication logs\n",
+        "5. Initiate incident response procedures"
+    ),
+    RiskLevel == "High", strcat(
+        "Priority Actions:\n",
+        "1. Review source IP: ", SourceIP, "\n",
+        "2. Monitor affected accounts for suspicious activity\n",
+        "3. Consider password reset for targeted accounts\n",
+        "4. Review successful authentications\n",
+        "5. Check for unusual account behavior"
+    ),
+    strcat(
+        "Recommended Actions:\n",
+        "1. Monitor for escalation\n",
+        "2. Review authentication patterns\n",
+        "3. Verify normal account usage"
+    )
+)
+| extend ThreatContext = strcat(
+    "Attack Analysis:\n",
+    "---------------\n",
+    "Pattern: ", AttackPattern, "\n",
+    "Risk Score: ", RiskScore, " (", RiskLevel, ")\n",
+    "Time Window: ", TimePeriod, " minutes\n",
+    "Attack Velocity: ", AttemptsPerMinute, " attempts/minute\n",
+    "Privileged Accounts Targeted: ", PrivilegedTargets, "\n",
+    "Total Accounts Targeted: ", UniqueAccounts, "\n",
+    "Authentication Events: ", array_strcat(EventTypes, ", "), "\n\n",
+    InvestigationSteps
+)
+| where RiskLevel in ("Critical", "High", "Medium")
+| project
+    TimeGenerated,
+    AttackPattern,
+    RiskLevel,
+    RiskScore,
+    Computer,
+    SourceIP,
+    FailedAttempts,
+    AttemptsPerMinute,
+    UniqueAccounts,
+    PrivilegedTargets,
+    ThreatContext
+| order by 
+    RiskScore desc,
+    TimeGenerated desc
