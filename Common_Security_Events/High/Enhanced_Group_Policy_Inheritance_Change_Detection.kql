@@ -1,0 +1,120 @@
+//////////////////////////////////////////////////////////////////////////////////////////////////
+// Title: Enhanced Group Policy Inheritance Change Detection
+// Purpose: Detect and analyze changes to Group Policy inheritance settings in Active Directory
+// Author: Sameer P Sheik 
+//////////////////////////////////////////////////////////////////////////////////////////////////
+// MITRE ATT&CK Mapping:
+// - Tactic: Defense Evasion (TA0005)
+// - Technique: Group Policy Modification (T1484.001)
+// - Sub-technique: Group Policy Modification
+//
+// Severity: High
+// - Impact: Critical for AD security posture
+// - Detectability: High
+// - False Positive Rate: Low
+//
+// Rule validation against Microsoft Sentinel Analytics:
+// - Complementary to: 
+//   * "Change to Domain Controller Policy" (Built-in)
+//   * "Sensitive Group Membership Changes" (Built-in)
+// - Added value:
+//   * Specific focus on GPO inheritance changes
+//   * Enhanced context with OU hierarchy analysis
+//   * Risk-based alerting based on OU depth
+//   * Change frequency analysis
+//
+// False Positive Scenarios:
+// 1. Legitimate GPO restructuring during planned AD changes
+// 2. Automated system maintenance activities
+// 3. Valid administrative changes during security hardening
+//
+// Required Data Connectors:
+// - Windows Security Events via AMA
+// - OR Security Events via Legacy Agent
+//
+// Minimum Log Level Required:
+// - Windows Event ID 5136 (Directory Service Changes)
+//
+// Risk Factors:
+// - High: Changes to OUs near domain root
+// - Medium: Multiple changes in short time window
+// - Low: Isolated changes to leaf OUs
+//
+// Alert Trigger Thresholds:
+// - High: Immediate for root-level OU changes
+// - Medium: >10 changes in 5-minute window
+// - Low: Single change monitoring
+//////////////////////////////////////////////////////////////////////////////////////////////////
+SecurityEvent
+| where TimeGenerated > ago(7d)  // Look back 7 days
+| where EventID == "5136"
+| where SubjectAccount != "NT AUTHORITY\\SYSTEM"  // Exclude system account
+| extend ParsedEventData = parse_xml(EventData)
+| extend 
+    ObjectDN = tostring(ParsedEventData.EventData.Data[2]["#text"]),
+    LDAPAttribute = tostring(ParsedEventData.EventData.Data[3]["#text"]),
+    AttributeValue = tostring(ParsedEventData.EventData.Data[4]["#text"]),
+    OperationType = tostring(ParsedEventData.EventData.Data[5]["#text"])
+| where LDAPAttribute == "gPOptions"
+| where AttributeValue == "1"
+| summarize 
+    arg_max(TimeGenerated, *),
+    ChangeCount = count() 
+    by bin(TimeGenerated, 5m)
+| extend 
+    DomainName = tostring(split(ObjectDN, ",")[1]),
+    OULevel = array_length(split(ObjectDN, ",")) - 2,
+    Activity = case(
+        OperationType == "14674" and AttributeValue == "1", "Group Policy Inheritance Blocked",
+        OperationType == "14675" and AttributeValue == "1", "Group Policy Inheritance Allowed",
+        "Unknown"
+    )
+| extend 
+    RiskLevel = case(
+        OULevel <= 2, "High",    // Changes near root are higher risk
+        OULevel <= 4, "Medium",
+        "Low"
+    ),
+    MITRETactic = "Defense Evasion",
+    MITRETechnique = "T1484.001 - Group Policy Modification",
+    DetectionSource = "Custom Analytics Rule - GPO Inheritance Monitor"
+| extend 
+    IsSuspiciousChange = ChangeCount > 10,  // Flag if more than 10 changes in 5 minutes
+    CorrelationId = new_guid()
+| project
+    TimeGenerated,
+    Actor = SubjectAccount,
+    TargetOU = ObjectDN,
+    DomainName,
+    Activity,
+    RiskLevel,
+    OULevel,
+    IsSuspiciousChange,
+    ChangeCount,
+    CorrelationId,
+    MITRETactic,
+    MITRETechnique,
+    DetectionSource
+| sort by TimeGenerated desc
+| extend
+    AlertSeverity = case(
+        RiskLevel == "High", "High",
+        IsSuspiciousChange == true, "Medium",
+        "Low"
+    ),
+    Recommendation = case(
+        RiskLevel == "High", strcat("CRITICAL: High-risk OU change detected - Immediate investigation required\n",
+            "- Check change authorization\n",
+            "- Review associated GPO modifications\n",
+            "- Verify domain admin activity\n",
+            "MITRE ATT&CK: ", MITRETechnique),
+        IsSuspiciousChange == true, strcat("WARNING: Suspicious change pattern - ", ChangeCount, " changes in 5-minute window\n",
+            "- Review change patterns\n",
+            "- Verify administrator activity\n",
+            "- Check for automated scripts\n",
+            "MITRE ATT&CK: ", MITRETechnique),
+        strcat("INFO: Regular GPO inheritance change\n",
+            "- Monitor for escalation\n",
+            "- Document if part of planned changes\n",
+            "MITRE ATT&CK: ", MITRETechnique)
+    )
