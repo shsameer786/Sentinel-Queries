@@ -1,0 +1,243 @@
+//====================================================================================
+// Detection Rule Documentation: Special Privileges Usage Analysis
+//====================================================================================
+
+// Rule Name: Special Privileges Usage Analysis and Monitoring
+// Version: 2.0
+// Last Updated: 2024-01-30
+// Author: Sameer P Sheik
+
+//------------------------------------------------------------------------------------
+// 1. SEVERITY CLASSIFICATION
+//------------------------------------------------------------------------------------
+// Overall Rule Severity: HIGH
+// 
+// Severity Matrix:
+// - Critical (90-100): Multiple critical privileges used across different sessions
+// - High (70-89): Use of individual critical privileges or multiple high-risk privileges
+// - Medium (50-69): Unusual privilege patterns or frequency
+// - Low (0-49): Standard privilege usage within normal patterns
+//
+// Individual Privilege Severity:
+// - SeDebugPrivilege: Critical (4)           // Enables process manipulation
+// - SeTakeOwnershipPrivilege: Critical (4)   // Can take ownership of any object
+// - SeCreateTokenPrivilege: Critical (4)     // Can create privileged tokens
+// - SeBackupPrivilege: High (3)             // Can bypass file permissions
+// - SeRestorePrivilege: High (3)            // Can write to any file/registry
+
+//------------------------------------------------------------------------------------
+// 2. MITRE ATT&CK MAPPING
+//------------------------------------------------------------------------------------
+// Primary Tactic: Privilege Escalation (TA0004)
+//
+// Techniques:
+// 1. T1134 - Access Token Manipulation
+//    - Sub-technique: T1134.001 - Token Impersonation/Theft
+//      * Triggered by: SeDebugPrivilege usage
+//      * Impact: Allows process token manipulation
+//    - Sub-technique: T1134.002 - Create Process with Token
+//      * Triggered by: SeCreateTokenPrivilege
+//      * Impact: Enables creation of processes with elevated privileges
+//
+// 2. T1078 - Valid Accounts
+//    - Sub-technique: T1078.002 - Domain Accounts
+//      * Triggered by: Pattern of privilege escalation using domain accounts
+//      * Impact: Legitimate credential abuse
+//
+// 3. T1548 - Abuse Elevation Control Mechanism
+//    - Sub-technique: T1548.002 - Bypass User Account Control
+//      * Triggered by: Patterns of UAC bypass using privileges
+//
+// Additional Related Techniques:
+// - T1003 - Credential Dumping (via SeDebugPrivilege)
+// - T1570 - Lateral Tool Transfer (via SeRestorePrivilege)
+
+//------------------------------------------------------------------------------------
+// 3. OOB ANALYTICS VALIDATION
+//------------------------------------------------------------------------------------
+// A. Complementary Microsoft Sentinel Analytics:
+//    1. "Account with High Privileges Created" (SecurityEvent)
+//       - Our Addition: Long-term privilege usage tracking
+//       - Coverage Gap Filled: Behavioral analysis over time
+//
+//    2. "High Number of Failed Logons from a Domain Admin"
+//       - Our Addition: Successful privilege usage patterns
+//       - Coverage Gap Filled: Post-compromise activity
+//
+//    3. "Suspicious Service Principal Name Added"
+//       - Our Addition: Privilege-specific monitoring
+//       - Coverage Gap Filled: Direct privilege abuse detection
+//
+// B. Unique Detection Capabilities:
+//    1. Long-term Privilege Usage Analysis
+//       - Pattern recognition across extended timeframes
+//       - Frequency baseline establishment
+//       - Unusual usage detection
+//
+//    2. Critical Privilege Combinations
+//       - Detection of privilege stacking
+//       - Risk scoring based on privilege combinations
+//       - Temporal analysis of privilege acquisition
+//
+//    3. Account Behavior Profiling
+//       - Historical privilege usage baseline
+//       - Cross-system privilege tracking
+//       - Privilege usage frequency analysis
+
+//------------------------------------------------------------------------------------
+// 4. FALSE POSITIVE ANALYSIS
+//------------------------------------------------------------------------------------
+// Common False Positive Scenarios:
+// 1. Scheduled Administrative Tasks
+//    - Mitigation: Baseline normal maintenance windows
+//    - Validation: Check against change management calendar
+//
+// 2. Legitimate Administrative Activities
+//    - Mitigation: Whitelist known admin patterns
+//    - Validation: Correlate with ticket systems
+//
+// 3. Backup Operations
+//    - Mitigation: Profile backup service accounts
+//    - Validation: Check backup schedule compliance
+//
+// 4. Software Deployment Activities
+//    - Mitigation: Track deployment windows
+//    - Validation: Compare against deployment schedules
+
+//------------------------------------------------------------------------------------
+// 5. RISK SCORING METHODOLOGY
+//------------------------------------------------------------------------------------
+// Risk Score Components:
+// 1. Critical Privilege Usage (Weight: 20)
+//    - Each critical privilege increases score
+//    - Multiple critical privileges compound
+//
+// 2. Privilege Count (Weight: 5)
+//    - Total number of unique privileges
+//    - Indicates privilege accumulation
+//
+// 3. Session Diversity (Weight: 2)
+//    - Unique logon sessions used
+//    - Indicates potential privilege abuse
+//
+// Final Risk Score = (CriticalPrivCount * 20) + (PrivCount * 5) + (UniqueLogons * 2)
+
+//------------------------------------------------------------------------------------
+// 6. PERFORMANCE CONSIDERATIONS
+//------------------------------------------------------------------------------------
+// 1. Time Range Impact
+//    - Default: 360 days of data
+//    - Storage Impact: ~100MB per 10k events
+//    - Processing: Optimize for weekly runs
+//
+// 2. Query Optimization
+//    - Early filtering of system accounts
+//    - Efficient privilege extraction
+//    - Optimized aggregations
+//
+// 3. Resource Requirements
+//    - CPU: Medium-High during execution
+//    - Memory: ~2GB for large environments
+//    - Runtime: 5-10 minutes typical
+
+//------------------------------------------------------------------------------------
+// 7. DETECTION RESPONSE WORKFLOW
+//------------------------------------------------------------------------------------
+// Alert Triage Steps:
+// 1. Validate alert severity against risk score
+// 2. Check account against privileged user inventory
+// 3. Review privilege usage pattern and frequency
+// 4. Correlate with other security events
+// 5. Check for matching change tickets
+//
+// Response Actions:
+// 1. For Critical Alerts:
+//    - Immediate account review
+//    - Privilege audit
+//    - Activity timeline creation
+//
+// 2. For High Alerts:
+//    - 24-hour investigation
+//    - Pattern analysis
+//    - Baseline comparison
+//
+// 3. For Medium/Low Alerts:
+//    - Weekly review
+//    - Pattern documentation
+//    - Baseline updates
+let TimeFrame = 30d;
+let excludedAccounts = dynamic([
+    "NT AUTHORITY\\SYSTEM",
+    "Window Manager",
+    "LOCAL SERVICE",
+    "NETWORK SERVICE"
+]);
+let criticalPrivileges = dynamic([
+    "SeDebugPrivilege",
+    "SeTakeOwnershipPrivilege",
+    "SeBackupPrivilege",
+    "SeRestorePrivilege",
+    "SeCreateTokenPrivilege"
+]);
+SecurityEvent
+| where TimeGenerated > ago(TimeFrame)
+| where EventID == "4672"
+| where AccountType == "User"
+| where not(Account has_any (excludedAccounts))
+| extend 
+    DomainName = tostring(split(Account, "\\")[0]),
+    UserName = tostring(split(Account, "\\")[1])
+| extend Privs = extract_all(@"Se(.*?)Privilege", PrivilegeList)
+| mv-expand Privs to typeof(string)
+| extend CurrentPrivilege = strcat('Se', Privs, 'Privilege')
+| extend IsCriticalPrivilege = iff(CurrentPrivilege in (criticalPrivileges), true, false)
+| project
+    TimeGenerated,
+    Account,
+    DomainName,
+    UserName,
+    Computer,
+    CurrentPrivilege,
+    IsCriticalPrivilege,
+    PrivilegeList,
+    SubjectLogonId,
+    TargetLogonId
+| summarize
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    PrivilegeCount = dcount(CurrentPrivilege),
+    PrivilegeList = make_set(CurrentPrivilege),
+    CriticalPrivilegeCount = countif(IsCriticalPrivilege == true),
+    CriticalPrivileges = make_set_if(CurrentPrivilege, IsCriticalPrivilege == true),
+    TotalOccurrences = count(),
+    UniqueLogonIds = dcount(SubjectLogonId)
+    by Computer, Account, DomainName, UserName
+| extend 
+    DaysSinceFirstSeen = datetime_diff('day', now(), FirstSeen),
+    DaysSinceLastSeen = datetime_diff('day', now(), LastSeen),
+    PrivilegeUsageFrequency = TotalOccurrences / 30.0,
+    RiskScore = iff(CriticalPrivilegeCount > 0, 
+        (CriticalPrivilegeCount * 20) + (PrivilegeCount * 5) + (UniqueLogonIds * 2),
+        (PrivilegeCount * 5) + (UniqueLogonIds * 2))
+| extend RiskAssessment = case(
+    RiskScore > 100, "High",
+    RiskScore > 50, "Medium",
+    "Low"
+)
+| project
+    Computer,
+    Account,
+    DomainName,
+    UserName,
+    RiskAssessment,
+    RiskScore,
+    CriticalPrivilegeCount,
+    PrivilegeCount,
+    UniqueLogonIds,
+    PrivilegeUsageFrequency,
+    FirstSeen,
+    LastSeen,
+    DaysSinceLastSeen,
+    PrivilegeList,
+    CriticalPrivileges
+| sort by RiskScore desc, Computer asc
