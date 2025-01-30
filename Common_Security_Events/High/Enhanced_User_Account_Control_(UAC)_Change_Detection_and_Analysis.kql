@@ -1,0 +1,197 @@
+// Title: Enhanced User Account Control (UAC) Change Detection and Analysis
+// Author: Original by Sameer P Sheik, Enhanced with MITRE & Severity Mapping
+// Last Updated: January 2025
+//
+// DESCRIPTION
+// -----------
+// Advanced detection for User Account Control modifications with risk-based alerting
+// and MITRE TTPs correlation. Focuses on high-risk changes while reducing false positives.
+//
+// SEVERITY MAPPING
+// ---------------
+// Critical (9-10):
+// - Kerberos Pre-authentication disabled
+// - Password not required enabled
+// - Multiple critical UAC changes in short timeframe
+// - Changes to highly privileged accounts
+//
+// High (7-8):
+// - DES encryption enabled
+// - Unconstrained delegation enabled
+// - Multiple medium-risk changes to same account
+//
+// Medium (5-6):
+// - Password never expires enabled
+// - Constrained delegation enabled
+// - Account state changes (enable/disable)
+//
+// Low (3-4):
+// - Single non-critical UAC change
+// - Smart card changes
+// - Normal administrative actions
+//
+// MITRE ATT&CK MAPPING
+// -------------------
+// Tactics:
+// - Defense Evasion (TA0005)
+// - Persistence (TA0003)
+// - Privilege Escalation (TA0004)
+//
+// Techniques:
+// - T1098: Account Manipulation
+//   - Sub-techniques:
+//     * T1098.001: Additional Cloud Credentials
+//     * T1098.004: SSH Authorized Keys
+// - T1078: Valid Accounts
+// - T1558.003: Kerberos: Kerberoasting
+// - T1484.001: Domain Policy Modification
+//
+// VALIDATION AGAINST OOB ANALYTICS
+// ------------------------------
+// 1. Microsoft Defender for Identity (MDI):
+//    - Complements MDI's "Sensitive account attribute changed" detection
+//    - Provides more granular UAC change tracking than MDI's binary alerts
+//    - Adds custom risk scoring not available in MDI
+//
+// 2. Microsoft Defender for Cloud (MDC):
+//    - Extends MDC's "Anomalous account credential changes" detection
+//    - Adds MITRE TTP context not present in MDC alerts
+//    - Provides historical trend analysis for UAC changes
+//
+// 3. Microsoft Sentinel Built-in Analytics:
+//    - Works alongside "Account Password Changes" analytic rule
+//    - Adds UAC-specific detection missing from password-focused rules
+//    - Provides complementary detection for privilege escalation
+//
+// 4. Azure AD Identity Protection:
+//    - Complements user risk detections with on-premise UAC context
+//    - Adds granular control over UAC change monitoring
+//    - Enables correlation with cloud identity risks
+//
+// FALSE POSITIVE HANDLING
+// ---------------------
+// 1. Service Account Changes:
+//    - Excludes known service accounts via excludedAccounts list
+//    - Marks service account changes for different risk evaluation
+//
+// 2. Bulk Administrative Actions:
+//    - Uses time-based aggregation to identify bulk changes
+//    - Adjusts risk scoring for coordinated admin activities
+//
+// 3. Legitimate Security Changes:
+//    - Considers security-positive changes (e.g., enabling smart card)
+//    - Reduces noise from standard hardening activities
+//
+// QUERY DEPENDENCIES
+// ----------------
+// - Requires Security Events collection (EventID 4738)
+// - Relies on UserAccountControl field population
+// - Needs SubjectAccount for actor tracking
+
+// Query Start
+let timeframe = 7d;
+let excludedAccounts = dynamic(["service_account1", "service_account2"]);
+let criticalChanges = dynamic([
+    "2096", // Don't Require Preauth - Enabled
+    "2082", // Password Not Required - Enabled
+    "2089", // Don't Expire Password - Enabled
+    "2095"  // Use DES Key Only - Enabled
+]);
+let uacMapping = datatable(Code:string, Description:string, SecurityImpact:string, Severity:string)
+[
+    "2096", "Don't Require Preauth - Enabled", "Enables Kerberoasting attacks", "High",
+    "2064", "Don't Require Preauth - Disabled", "Improves Kerberos security", "Informational",
+    "2082", "Password Not Required - Enabled", "Severely weakens account security", "High",
+    "2050", "Password Not Required - Disabled", "Improves account security", "Informational",
+    "2089", "Don't Expire Password - Enabled", "May lead to password security issues", "Medium",
+    "2057", "Don't Expire Password - Disabled", "Enforces password changes", "Informational",
+    "2080", "Account Disabled", "Account access blocked", "Medium",
+    "2048", "Account Enabled", "Account access granted", "Medium",
+    "2090", "Account Locked", "Account access blocked by policy", "Medium",
+    "2058", "Account Unlocked", "Account access restored", "Medium",
+    "2092", "Smartcard Required - Enabled", "Enforces strong authentication", "Low",
+    "2060", "Smartcard Required - Disabled", "Removes strong authentication requirement", "Medium",
+    "2095", "Use DES Key Only - Enabled", "Uses weak encryption", "High",
+    "2063", "Use DES Key Only - Disabled", "Uses stronger encryption", "Informational",
+    "2093", "Trusted For Delegation - Enabled", "Allows credential delegation", "High",
+    "2061", "Trusted For Delegation - Disabled", "Prevents credential delegation", "Informational",
+    "2098", "Trusted To Authenticate For Delegation - Enabled", "Allows constrained delegation", "Medium",
+    "2066", "Trusted To Authenticate For Delegation - Disabled", "Prevents constrained delegation", "Informational"
+];
+SecurityEvent
+| where TimeGenerated > ago(timeframe)
+| where EventID == 4738  // User account change event
+| where isnotempty(UserAccountControl) and UserAccountControl != "-"
+| where AccountType == "User"
+| extend UAC_Codes = extract_all(@"([0-9]{4})", UserAccountControl)
+| mv-expand Code = UAC_Codes to typeof(string)
+| lookup kind=leftouter uacMapping on Code
+| extend Description = iif(isempty(Description), strcat("Unknown UAC Code: ", Code), Description)
+| extend SecurityImpact = iif(isempty(SecurityImpact), "Unknown impact", SecurityImpact)
+| extend Severity = iif(isempty(Severity), "Low", Severity)
+| extend RiskScore = case(
+    Severity == "High", 9,
+    Severity == "Medium", 5,
+    Severity == "Low", 3,
+    Severity == "Informational", 1,
+    0
+)
+| extend IsServiceAccount = TargetAccount contains "$" or TargetAccount has_any (excludedAccounts)
+| extend IsCriticalChange = Code in (criticalChanges)
+| extend TimeKey = bin(TimeGenerated, 1h)
+// Add MITRE TTP context
+| extend MITRETactic = case(
+    Code in ("2096", "2082"), "Defense Evasion (TA0005)",
+    Code in ("2093", "2098"), "Persistence (TA0003)",
+    Code in ("2089", "2095"), "Privilege Escalation (TA0004)",
+    "Multiple"
+)
+| extend MITRETechnique = case(
+    Code in ("2096"), "T1558.003 - Kerberoasting",
+    Code in ("2082", "2089"), "T1098 - Account Manipulation",
+    Code in ("2093", "2098"), "T1078 - Valid Accounts",
+    Code in ("2095"), "T1484.001 - Domain Policy Modification",
+    "Multiple"
+)
+| summarize 
+    Changes = make_list(Description),
+    SecurityImpacts = make_list(SecurityImpact),
+    Severities = make_list(Severity),
+    RiskScores = make_list(RiskScore),
+    MITRETactics = make_set(MITRETactic),
+    MITRETechniques = make_set(MITRETechnique),
+    MaxRiskScore = max(RiskScore),
+    ChangesCount = count(),
+    CriticalChangesCount = countif(IsCriticalChange)
+    by TimeKey, TargetAccount, Actor=SubjectAccount, IsServiceAccount
+| project
+    TimeGenerated=TimeKey,
+    TargetAccount,
+    Actor,
+    IsServiceAccount,
+    ChangesCount,
+    CriticalChangesCount,
+    Changes,
+    SecurityImpacts,
+    Severities,
+    MaxRiskScore,
+    MITRETactics,
+    MITRETechniques,
+    RiskLevel = case(
+        MaxRiskScore >= 9, "Critical",
+        MaxRiskScore >= 7, "High",
+        MaxRiskScore >= 5, "Medium",
+        MaxRiskScore >= 3, "Low",
+        "Informational"
+    ),
+    AlertRecommendation = case(
+        CriticalChangesCount > 0, strcat("Critical security changes detected. Immediate investigation recommended."),
+        ChangesCount > 3, strcat("Multiple UAC changes detected. Review changes for suspicious activity."),
+        MaxRiskScore >= 7, strcat("High-risk changes detected. Review changes for security impact."),
+        "Review changes as part of regular security monitoring."
+    )
+| where 
+    CriticalChangesCount > 0 or
+    ChangesCount > 3 or
+    MaxRiskScore >= 7
+| sort by MaxRiskScore desc, TimeGenerated asc

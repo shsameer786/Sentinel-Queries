@@ -1,0 +1,39 @@
+//=====================================
+// Query Name: Unconstrained Kerberos Delegation Detection (Computer Accounts)
+// Author: Sameer P Sheik
+// Version: 2.1
+//=====================================
+// Description: 
+// Detects when unconstrained Kerberos delegation is enabled on a computer object (UserAccountControl flag 0x2080).
+// Attackers use this for credential theft and lateral movement.
+//=====================================
+// Severity Mapping:
+// - Critical: Domain Controllers modified for delegation
+// - High: Privileged computers (e.g., admin workstations) granted delegation rights
+// - Medium: Regular servers or workstations granted delegation rights (may be legitimate)
+//=====================================
+// MITRE ATT&CK® Mapping:
+// - T1098: Account Manipulation (Modifying account properties for delegation abuse)
+// - T1550.001: Use Alternate Authentication Material (Ticket Injection via delegation)
+// - T1078: Valid Accounts (Persistence via unconstrained delegation)
+//=====================================
+// Validation Against OOB Analytics:
+// - Complements Microsoft Security Analytics (EventID 4742 - UserAccountControl changes)
+// - Enhances Microsoft Defender for Identity detections on delegation abuse
+// - Works with Sentinel UEBA to track anomalous computer account modifications
+//=====================================
+
+SecurityEvent
+| where TimeGenerated > ago(30d)
+| where EventID == "4742"
+| extend NewUacValue = extract("NewUacValue\">(.*?)</Data>", 1, EventData)  // Extract UAC changes
+| extend ComputerName = coalesce(TargetUserName, Computer)  // Ensure correct computer field
+| extend Actor = coalesce(SubjectAccount, SubjectUserName, "Unknown")  // Ensure correct actor field
+| where UserAccountControl has "%%8320"  // Match unconstrained delegation
+| extend Severity = case(
+    ComputerName contains "DC$", "Critical",
+    ComputerName contains "Admin", "High",
+    "Medium"
+)
+| project TimeGenerated, Activity="Unconstrained Kerberos Delegation Enabled on Computer", ComputerName, Actor, Severity
+| sort by TimeGenerated desc
