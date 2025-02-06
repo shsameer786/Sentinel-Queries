@@ -1,0 +1,166 @@
+// Title: Advanced Detection for AADInternals and Suspicious Domain Federation Changes
+// Description: Detects potential abuse of AADInternals tool and suspicious domain federation changes in Azure AD
+// Author: [Your Organization]
+// Last Updated: 2025-02-06
+
+// MITRE ATT&CK Mapping:
+// - Tactic: Defense Evasion (TA0005)
+//   - Technique: Modify Authentication Process (T1556)
+//     - Sub-technique: Federation (T1556.007)
+// - Tactic: Persistence (TA0003)
+//   - Technique: Account Manipulation (T1098)
+//     - Sub-technique: Additional Cloud Credentials (T1098.001)
+// - Tactic: Initial Access (TA0001)
+//   - Technique: Valid Accounts (T1078)
+//     - Sub-technique: Cloud Accounts (T1078.004)
+
+// Severity: High
+// Severity Explanation:
+// - Critical impact on authentication infrastructure
+// - Potential for persistent unauthorized access
+// - Commonly used in advanced attack scenarios
+// - Can lead to complete domain compromise
+
+// Rule Coverage Analysis:
+// This rule complements existing OOB detections:
+// 1. Microsoft 365 Defender Built-in Alert: "Suspicious federation domain addition"
+//    - This custom rule adds: Risk scoring, timing analysis, and specific AADInternals patterns
+// 2. Defender for Cloud Apps Alert: "Suspicious domain federation"
+//    - This custom rule adds: More comprehensive issuer validation and character analysis
+// 3. Azure AD Identity Protection: "Unfamiliar sign-in properties"
+//    - This custom rule adds: Business hours context and federation-specific patterns
+
+// False Positive Scenarios:
+// 1. Legitimate federation setup during non-business hours
+// 2. Planned migration activities using automation tools
+// 3. Emergency federation changes by authorized administrators
+
+// Required Data Connectors:
+// - M365 Defender - CloudAppEvents
+// Query Start
+CloudAppEvents
+| where TimeGenerated > ago(360d)
+| where ActionType == "Set domain authentication."
+| extend Actor = tostring(RawEventData.UserId)
+| extend ClientIP = tostring(RawEventData.ClientIP)
+| extend UserAgent = tostring(RawEventData.UserAgent)
+| extend mp = parse_json(RawEventData.ModifiedProperties)
+| extend DomainName = tostring(parse_json(tostring(RawEventData.Target))[0].ID)
+| mv-apply mp on (
+    where mp.Name == "IssuerUri"
+    | extend Issuer = mp.NewValue
+)
+| mv-apply mp on (
+    where mp.Name == "LiveType"
+    | extend OldDomainType = mp.OldValue
+    | extend NewDomainType = mp.NewValue
+)
+// Enhance domain analysis
+| extend PrimaryDomain = tolower(tostring(split(DomainName, '.')[0]))
+| extend DomainSuffix = tolower(tostring(split(DomainName, '.')[1]))
+| parse Issuer with * '://' IssuerDomain @'"' *
+| extend IssuerSuffix = split(IssuerDomain, '/')[-1]
+// Add risk indicators and initial severity
+| extend RiskScore = 0
+| extend RiskIndicators = "["
+| extend Severity = "Low"  // Default severity
+// Check suspicious issuer
+| extend RiskScore = iff(Issuer has "any.sts" or Issuer has "sts.any" or Issuer has "federation.local" or Issuer has "adfs.lab",
+    RiskScore + 2,  // Increased weight for suspicious issuers
+    RiskScore)
+| extend RiskIndicators = iff(Issuer has "any.sts" or Issuer has "sts.any" or Issuer has "federation.local" or Issuer has "adfs.lab",
+    strcat(RiskIndicators, "'Suspicious Issuer (T1556.007)', "),
+    RiskIndicators)
+// Check unknown issuer
+| extend RiskScore = iff(not(Issuer has "sts.windows.net" or Issuer has "login.microsoftonline.com"),
+    RiskScore + 1,
+    RiskScore)
+| extend RiskIndicators = iff(not(Issuer has "sts.windows.net" or Issuer has "login.microsoftonline.com"),
+    strcat(RiskIndicators, "'Unknown Issuer (T1098.001)', "),
+    RiskIndicators)
+// Check suspicious pattern
+| extend RiskScore = iff(IssuerSuffix matches regex "^[a-zA-Z0-9]{8}$",
+    RiskScore + 2,
+    RiskScore)
+| extend RiskIndicators = iff(IssuerSuffix matches regex "^[a-zA-Z0-9]{8}$",
+    strcat(RiskIndicators, "'Suspicious Issuer Pattern (T1556.007)', "),
+    RiskIndicators)
+// Check AADInternals
+| extend RiskScore = iff(UserAgent has "AADInternals",
+    RiskScore + 3,  // Highest weight for direct tool detection
+    RiskScore)
+| extend RiskIndicators = iff(UserAgent has "AADInternals",
+    strcat(RiskIndicators, "'AADInternals Tool Usage (T1078.004)', "),
+    RiskIndicators)
+// Check suspicious characters
+| extend RiskScore = iff(PrimaryDomain has "\\" or PrimaryDomain has "/" or PrimaryDomain has "=" or PrimaryDomain has "+" 
+    or PrimaryDomain has "<" or PrimaryDomain has ">" or PrimaryDomain has "*",
+    RiskScore + 2,
+    RiskScore)
+| extend RiskIndicators = iff(PrimaryDomain has "\\" or PrimaryDomain has "/" or PrimaryDomain has "=" or PrimaryDomain has "+" 
+    or PrimaryDomain has "<" or PrimaryDomain has ">" or PrimaryDomain has "*",
+    strcat(RiskIndicators, "'Suspicious Domain Characters (T1098.001)', "),
+    RiskIndicators)
+// Close the risk indicators array
+| extend RiskIndicators = strcat(substring(RiskIndicators, 0, strlen(RiskIndicators) - 1), "]")
+// Check for suspicious timing
+| extend Hour = datetime_part("Hour", TimeGenerated)
+| extend WeekDay = dayofweek(TimeGenerated)
+| extend IsOutsideBusinessHours = Hour < 8 or Hour > 18 or WeekDay == 0 or WeekDay == 6
+// Check for anomalous activity
+| extend IsAnomalousTime = Hour < 8 or Hour > 18
+// Update risk score with timing
+| extend RiskScore = RiskScore + iff(IsOutsideBusinessHours, 1, 0) + iff(IsAnomalousTime, 1, 0)
+// Calculate Severity based on RiskScore
+| extend Severity = case(
+    RiskScore >= 5, "High",
+    RiskScore >= 3, "Medium",
+    RiskScore >= 1, "Low",
+    "Informational"
+)
+// Final filtering
+| where (OldDomainType has "Managed" and NewDomainType has "Federated")
+    and (
+        Issuer has "any.sts"
+        or Issuer has "sts.any"
+        or Issuer has "federation.local"
+        or Issuer has "adfs.lab"
+        or IssuerSuffix matches regex "^[a-zA-Z0-9]{8}$"
+        or RiskScore > 0
+        or (IsOutsideBusinessHours and IsAnomalousTime)
+    )
+| project
+    TimeGenerated,
+    Actor,
+    ClientIP,
+    DomainName,
+    OldDomainType,
+    NewDomainType,
+    Issuer,
+    IssuerSuffix,
+    UserAgent,
+    RiskIndicators,
+    RiskScore,
+    Severity,
+    IsOutsideBusinessHours,
+    IsAnomalousTime
+| order by RiskScore desc, TimeGenerated desc
+
+// Response Guidance:
+// High Severity (RiskScore >= 5):
+// - Immediate incident response required
+// - Block suspicious federation domain
+// - Investigate actor's recent activities
+// - Review authentication logs for affected domains
+// - Consider forcing password reset for affected accounts
+
+// Medium Severity (RiskScore >= 3):
+// - Investigation required within 4 hours
+// - Review change management records
+// - Validate federation configuration
+// - Document justification for changes
+
+// Low Severity (RiskScore >= 1):
+// - Investigation required within 24 hours
+// - Validate change with domain owner
+// - Document changes in change management system
