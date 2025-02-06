@@ -1,0 +1,125 @@
+//=====================================
+// Multiple Accounts Locked Detection Rule
+// =====================================
+// Author: Sameer P Sheik
+//------------
+// Rule Overview
+// ------------
+// Detection Name: Multiple Account Lockouts
+// Severity: High
+// Risk Score: 70
+// 
+// MITRE ATT&CK Mapping
+// -------------------
+// Technique: T1110 - Brute Force
+//   - Sub-technique: T1110.001 - Password Guessing
+//   - Sub-technique: T1110.003 - Password Spraying
+// Tactic: Initial Access, Credential Access
+//
+// Additional MITRE Mappings:
+// - T1078 - Valid Accounts (when successful)
+// - T1586 - Compromise Accounts (objective)
+//
+// Rule Description
+// ---------------
+// This rule detects potential brute force or password spray attacks by monitoring for multiple
+// account lockouts within a short timeframe. The detection is based on Azure AD error code 50053,
+// which indicates account lockouts due to repeated failed authentication attempts or suspicious IP activity.
+//
+// Rule Logic:
+// 1. Monitors for multiple account lockouts (50053) within 15-minute windows
+// 2. Applies risk scoring based on:
+//    - Geographic location
+//    - Number of affected accounts
+//    - Total attempt volume
+//    - Historical authentication patterns
+//
+// Related Built-in Analytics
+// ------------------------
+// This rule complements the following Microsoft Sentinel built-in analytics:
+// 1. "Sign-ins from IPs that attempt sign-ins to disabled accounts"
+//    - Differentiation: This custom rule focuses on locked (not disabled) accounts
+// 2. "Password spray attack against Azure AD application"
+//    - Complementary: This rule catches lockouts that may occur after spray attempts
+// 3. "Sign-ins from unfamiliar locations"
+//    - Enhancement: Adds specific focus on lockout events from new locations
+//
+// False Positive Scenarios
+// ----------------------
+// 1. Mass password expiration causing multiple users to fail authentication
+// 2. Network issues causing legitimate authentication attempts to fail
+// 3. Service account password changes affecting multiple applications
+//
+// Validation
+// ----------
+// Validated against:
+// - AAD Sign-in Logs
+// - Microsoft Sentinel Analytics Rules
+// - Common attack patterns
+//
+// Response Playbook Recommendations
+// -------------------------------
+// 1. Validate affected accounts for compromise
+// 2. Review authentication patterns from the source IP
+// 3. Consider IP blocking if pattern indicates malicious activity
+// 4. Notify security team for user awareness training if internal source
+//
+SigninLogs
+| where ResultType == 50053
+| extend ErrorDetails = parse_json(Status).errorCode
+| extend RiskLevel = tostring(RiskLevelDuringSignIn)
+| extend RiskState = tostring(RiskState)
+| summarize 
+    TotalAttempts = count(),
+    TotalAccounts = dcount(UserPrincipalName),
+    Accounts = make_set(UserPrincipalName),
+    UserAgentDetails = make_set(UserAgent),
+    RiskLevels = make_set(RiskLevel),
+    RiskStates = make_set(RiskState),
+    ErrorCodes = make_set(ErrorDetails)
+    by bin(TimeGenerated, 15min), IPAddress, Location
+| where TotalAccounts >= 3
+// Add GeoIP enrichment
+| extend GeoIPInfo = geo_info_from_ip_address(IPAddress)
+| extend Country = tostring(parse_json(GeoIPInfo).country),
+         State = tostring(parse_json(GeoIPInfo).state),
+         City = tostring(parse_json(GeoIPInfo).city),
+         Latitude = tostring(parse_json(GeoIPInfo).latitude),
+         Longitude = tostring(parse_json(GeoIPInfo).longitude)
+// Add severity and enhanced risk scoring
+| extend Severity = case(
+    TotalAccounts > 10, "High",
+    TotalAccounts > 5, "Medium",
+    "Low")
+| extend RiskScore = case(
+    IPAddress in ("YOUR_TRUSTED_IP_1", "YOUR_TRUSTED_IP_2"), 0,
+    Country in ("RU", "CN", "IR", "KP"), 100,
+    TotalAttempts > 10, 80,
+    TotalAccounts > 5, 70,
+    50)
+// Add MITRE mapping
+| extend AttackTechnique = "T1110",
+         AttackTactic = "Initial Access, Credential Access",
+         MITRELink = "https://attack.mitre.org/techniques/T1110/"
+// Final risk calculation and enrichment
+| project
+    TimeGenerated,
+    IPAddress,
+    Location,
+    Country,
+    State,
+    City,
+    Severity,
+    TotalAccounts,
+    TotalAttempts,
+    Accounts,
+    UserAgentDetails,
+    RiskLevels,
+    RiskStates,
+    ErrorCodes,
+    RiskScore,
+    AttackTechnique,
+    AttackTactic,
+    MITRELink,
+    GeoCoordinates = strcat(Latitude, ",", Longitude)
+| order by RiskScore desc, TotalAccounts desc

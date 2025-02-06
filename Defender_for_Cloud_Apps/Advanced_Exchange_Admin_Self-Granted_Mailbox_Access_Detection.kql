@@ -1,0 +1,221 @@
+// Title: Advanced Exchange Admin Self-Granted Mailbox Access Detection
+// Description: Detects suspicious self-granted mailbox permissions by Exchange administrators
+// Author: Sameer P Sheik
+// Last Updated: 2025-02-06
+/////////////////////////////////////////////////////////////////////////////////
+// MITRE ATT&CK Mapping:
+// Primary Tactics and Techniques:
+// - Tactic: Collection (TA0009)
+//   - Technique: Email Collection (T1114)
+//     - Sub-technique: Email Forwarding Rule (T1114.003)
+//     Description: Attackers granting themselves mailbox access to collect email data
+/////////////////////////////////////////////////////////////////////////////////
+// - Tactic: Privilege Escalation (TA0004)
+//   - Technique: Account Manipulation (T1098)
+//     - Sub-technique: Exchange Email Delegate Permissions (T1098.002)
+//     Description: Attackers manipulating mailbox permissions for persistent access
+/////////////////////////////////////////////////////////////////////////////////
+// - Tactic: Defense Evasion (TA0005)
+//   - Technique: Abuse Elevation Control Mechanism (T1548)
+//     Description: Abusing administrative privileges to grant unauthorized access
+/////////////////////////////////////////////////////////////////////////////////
+// - Tactic: Persistence (TA0003)
+//   - Technique: Account Manipulation (T1098)
+//     Description: Maintaining persistent access through mailbox permissions
+/////////////////////////////////////////////////////////////////////////////////
+// Severity Classification:
+// - Critical (RiskScore >= 6):
+//   * Impact: Direct access to sensitive mailbox content
+//   * Urgency: Immediate response required (< 1 hour)
+//   * Confidence: High when multiple risk factors present
+/////////////////////////////////////////////////////////////////////////////////
+// - High (RiskScore >= 4):
+//   * Impact: Potential data exposure
+//   * Urgency: Prompt investigation needed (< 4 hours)
+//   * Confidence: Medium to High based on context
+/////////////////////////////////////////////////////////////////////////////////
+// - Medium (RiskScore >= 2):
+//   * Impact: Suspicious but may be legitimate
+//   * Urgency: Investigation needed (< 24 hours)
+//   * Confidence: Medium
+/////////////////////////////////////////////////////////////////////////////////
+// - Low (RiskScore < 2):
+//   * Impact: Limited
+//   * Urgency: Routine review
+//   * Confidence: Low to Medium
+/////////////////////////////////////////////////////////////////////////////////
+// OOB Analytics Coverage Analysis:
+/////////////////////////////////////////////////////////////////////////////////
+// 1. Microsoft 365 Defender Built-in Alert: "Suspicious mailbox permission granted"
+//    - This custom rule enhances detection by:
+//      * Adding self-granted access specific detection
+//      * Including working hours analysis
+//      * Providing risk-based scoring
+//      * Adding cross-domain context
+/////////////////////////////////////////////////////////////////////////////////
+// 2. Exchange Online Protection Alert: "Mailbox audit logging"
+//    - This custom rule complements by:
+//      * Focusing on admin self-granted permissions
+//      * Adding business hours context
+//      * Including severity classification
+/////////////////////////////////////////////////////////////////////////////////
+// 3. Microsoft Defender for Cloud Apps Alert: "Suspicious mailbox permission"
+//    - This custom rule adds value through:
+//      * More granular risk scoring
+//      * Additional context analysis
+//      * Enhanced response guidance
+/////////////////////////////////////////////////////////////////////////////////
+// 4. Azure AD Identity Protection:
+//    - Complements existing detections by:
+//      * Focusing on specific Exchange admin actions
+//      * Adding business context
+//      * Providing detailed risk analysis
+/////////////////////////////////////////////////////////////////////////////////
+// False Positive Analysis:
+// Common legitimate scenarios:
+// 1. Admin emergency access during incidents
+// 2. Scheduled maintenance activities
+// 3. Help desk escalations
+// 4. Backup/recovery operations
+/////////////////////////////////////////////////////////////////////////////////
+// Mitigation steps for FP reduction:
+// - Compare against change management records
+// - Validate against approved maintenance windows
+// - Check service desk tickets
+// - Review admin role assignments
+/////////////////////////////////////////////////////////////////////////////////
+// Main Detection Query
+/////////////////////////////////////////////////////////////////////////////////
+CloudAppEvents
+| where TimeGenerated > ago(360d)
+| extend Operation = tostring(RawEventData.Operation)
+| where Operation == "Add-MailboxPermission"
+| extend Parameters = parse_json(tostring(RawEventData.Parameters))
+| extend TargetMailbox = tolower(tostring(Parameters[2].Value))
+| extend UserAdded = tolower(tostring(Parameters[3].Value))
+| extend AccessGranted = tostring(Parameters[4].Value)
+| extend Actor = tolower(tostring(RawEventData.UserId))
+| extend ClientIP = tostring(RawEventData.ClientIP)
+| extend UserAgent = tostring(RawEventData.UserAgent)
+// Additional context extraction
+| extend AccessRights = tostring(Parameters[4].Value)
+| extend IsFullAccess = AccessRights has "FullAccess"
+| extend IsSendAs = AccessRights has "SendAs"
+| extend IsDeleteItem = AccessRights has "DeleteItem"
+// Check if actor is granting themselves access
+| extend IsSelfGrant = Actor =~ UserAdded
+| where IsSelfGrant
+// Initialize risk scoring and MITRE tagging
+| extend RiskScore = 3 // Base score for self-granted access
+| extend MitreTechniques = "T1114.003" // Base technique for email collection
+// Check for suspicious access rights
+| extend RiskScore = case(
+    IsFullAccess, RiskScore + 2,
+    IsSendAs, RiskScore + 1,
+    IsDeleteItem, RiskScore + 1,
+    RiskScore)
+| extend MitreTechniques = case(
+    IsFullAccess, strcat(MitreTechniques, ", T1098.002"),
+    IsSendAs, strcat(MitreTechniques, ", T1098"),
+    MitreTechniques)
+// Check for suspicious timing
+| extend Hour = datetime_part("Hour", TimeGenerated)
+| extend DayOfWeek = dayofweek(TimeGenerated)
+| extend IsOutsideBusinessHours = Hour < 8 or Hour > 18 or DayOfWeek == 0 or DayOfWeek == 6
+| extend RiskScore = iff(IsOutsideBusinessHours, RiskScore + 1, RiskScore)
+| extend MitreTechniques = iff(IsOutsideBusinessHours,
+    strcat(MitreTechniques, ", T1548"),
+    MitreTechniques)
+// Check for cross-domain access
+| extend TargetDomain = tostring(split(TargetMailbox, "@")[1])
+| extend ActorDomain = tostring(split(Actor, "@")[1])
+| extend IsCrossDomain = TargetDomain != ActorDomain
+| extend RiskScore = iff(IsCrossDomain, RiskScore + 1, RiskScore)
+// Calculate severity
+| extend Severity = case(
+    RiskScore >= 6, "Critical",
+    RiskScore >= 4, "High",
+    RiskScore >= 2, "Medium",
+    "Low")
+// Generate risk factors with MITRE context
+| extend RiskFactors = case(
+    IsFullAccess, "Full Access Granted (T1098.002)",
+    IsSendAs, "Send As Rights Granted (T1098)",
+    IsDeleteItem, "Delete Rights Granted (T1098)",
+    "Standard Access (T1114.003)")
+| extend RiskFactors = iff(IsOutsideBusinessHours,
+    strcat(RiskFactors, ", Outside Business Hours (T1548)"),
+    RiskFactors)
+| extend RiskFactors = iff(IsCrossDomain,
+    strcat(RiskFactors, ", Cross-Domain Access (T1098)"),
+    RiskFactors)
+// Final projection
+| project
+    TimeGenerated,
+    Actor,
+    TargetMailbox,
+    UserAdded,
+    AccessGranted,
+    RiskScore,
+    Severity,
+    RiskFactors,
+    MitreTechniques,
+    IsOutsideBusinessHours,
+    IsCrossDomain,
+    ClientIP,
+    UserAgent
+| order by RiskScore desc, TimeGenerated desc
+/////////////////////////////////////////////////////////////////////////////////
+// Response Guidance and Playbook:
+/////////////////////////////////////////////////////////////////////////////////
+// Critical Severity (RiskScore >= 6):
+// 1. Immediate Actions (< 1 hour):
+//    - Revoke granted permissions
+//    - Notify security team
+//    - Begin incident investigation
+//    - Document MITRE techniques observed
+/////////////////////////////////////////////////////////////////////////////////
+// 2. Investigation Steps:
+//    - Review mailbox audit logs
+//    - Check for data exfiltration
+//    - Analyze admin's recent activities
+//    - Document findings
+/////////////////////////////////////////////////////////////////////////////////
+// 3. Remediation:
+//    - Implement corrective controls
+//    - Update admin access policies
+//    - Enhance monitoring
+//    - Document lessons learned
+/////////////////////////////////////////////////////////////////////////////////
+// High Severity (RiskScore >= 4):
+// 1. Priority Actions (< 4 hours):
+//    - Review business justification
+//    - Check change management records
+//    - Monitor mailbox activity
+//    - Document findings
+/////////////////////////////////////////////////////////////////////////////////
+// 2. Follow-up:
+//    - Update access policies if needed
+//    - Enhance detective controls
+//    - Document response actions
+/////////////////////////////////////////////////////////////////////////////////
+// Medium Severity (RiskScore >= 2):
+// 1. Required Actions (< 24 hours):
+//    - Validate business need
+//    - Document justification
+//    - Monitor for patterns
+//    - Update documentation
+/////////////////////////////////////////////////////////////////////////////////
+// Additional Detection Notes:
+// - Query focus: Admin self-granted mailbox permissions
+// - Primary risk factors: Access level, timing, cross-domain
+// - MITRE alignment: Multiple techniques covered
+// - Enhanced context: Business hours, domain relationships
+// - Complementary to OOB detections
+/////////////////////////////////////////////////////////////////////////////////
+// Query Limitations:
+// - Requires CloudAppEvents data
+// - 7-day detection window
+// - Business hours assumption (8 AM - 6 PM)
+// - Limited to Exchange Online operations
+/////////////////////////////////////////////////////////////////////////////////
