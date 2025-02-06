@@ -1,0 +1,43 @@
+//=====================================
+// Query Name: Account Sensitivity Flag Change Detection
+// Author: Sameer P Sheik
+// Version: 2.0
+//=====================================
+// Description: 
+// Detects changes to the "Account is sensitive and cannot be delegated" flag on an account.
+// This helps identify administrative changes that may indicate privilege escalation or policy violations.
+//=====================================
+// Severity Mapping:
+// - High: Multiple instances of disabling "Account Sensitivity" in a short period.
+// - Medium: A single instance of disabling "Account Sensitivity."
+// - Low: Enabling "Account Sensitivity" (expected administrative action).
+//=====================================
+// MITRE ATT&CK® Mapping:
+// - T1098: Account Manipulation
+// - T1556.004: Modify Authentication Process (Delegation abuse)
+// - T1078: Valid Accounts (Abuse of privileged accounts)
+//=====================================
+// Validation Against OOB Analytics:
+// - Complements Microsoft Security Analytics (EventID 4738 - UserAccountControl changes).
+// - Enhances Microsoft Defender for Identity detections related to privilege abuse.
+// - Works with Sentinel UEBA for anomaly-based account modifications.
+//=====================================
+
+SecurityEvent
+| where TimeGenerated > ago(360d)  // Ensure broad detection window
+| where EventID == "4738"
+| where isnotempty(UserAccountControl)  // Filter only relevant changes
+| where UserAccountControl has_any("%%2094", "%%2062")  // Match actual log format for sensitivity flag
+| extend Activity = case(
+    UserAccountControl contains "%%2094", "Account Sensitivity Enabled",  // Flag set to prevent delegation
+    UserAccountControl contains "%%2062", "Account Sensitivity Disabled", // Flag removed, increasing risk
+    "Unknown"
+)
+| extend Severity = case(
+    Activity == "Account Sensitivity Disabled" and count() over (1d) >= 3, "High",  // Multiple disables in 24h
+    Activity == "Account Sensitivity Disabled", "Medium",  // Single disable event
+    Activity == "Account Sensitivity Enabled", "Low",  // Likely expected admin action
+    "Informational"
+)
+| project TimeGenerated, Target=TargetAccount, Actor=SubjectAccount, UserAccountControl, Activity, Severity
+| sort by TimeGenerated desc

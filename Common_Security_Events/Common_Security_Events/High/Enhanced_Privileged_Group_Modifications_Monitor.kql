@@ -1,0 +1,94 @@
+//=====================================
+// Rule Name: Enhanced Privileged Group Modifications Monitor
+// Severity: High
+// MITRE TTPs: 
+//   - T1078.002 (Valid Accounts: Domain Accounts)
+//   - T1484 (Domain Policy Modification) 
+//   - T1484.001 (Domain Policy Modification: Group Policy Modification)
+// 
+// Description: 
+// Advanced detection of privileged AD group modifications including additions, removals and changes.
+// Provides enriched context including risk levels, actor details and recommended actions.
+//
+// Validation & Coverage:
+// - Extends Microsoft Sentinel built-in "Addition to privileged groups" analytics rule
+// - Additional coverage:
+//   * Monitors group removals and modifications (not just additions)
+//   * Tracks broader set of privileged groups
+//   * Provides actor domain context
+//   * Includes recommended actions
+//   * Maps to additional MITRE TTPs
+//=====================================
+
+SecurityEvent
+| where TimeGenerated > ago(30d)
+// Include both additions and removals from groups
+| where EventID in (
+   4728, 4732, 4756,  // Member added to security group
+   4729, 4733, 4757,  // Member removed from security group
+   4731, 4734, 4735,  // Security group created/modified/deleted
+   4737                // Security group modified
+   )
+| extend GroupName = tostring(TargetUserName)
+| extend ModificationType = case(
+   EventID in (4728, 4732, 4756), "Member Added",
+   EventID in (4729, 4733, 4757), "Member Removed",
+   EventID == 4731, "Group Created",
+   EventID == 4734, "Group Modified",
+   EventID == 4735, "Group Deleted",
+   "Other Change"
+   )
+| extend AffectedAccount = case(
+   isnotempty(extract("Account Name:\\s+([\\w\\\\.-]+)", 1, tostring(EventData))), extract("Account Name:\\s+([\\w\\\\.-]+)", 1, tostring(EventData)),
+   isnotempty(extract("Group Name:\\s+([\\w\\\\.-]+)", 1, tostring(EventData))), extract("Group Name:\\s+([\\w\\\\.-]+)", 1, tostring(EventData)),
+   "Unknown Account"
+   )
+| where GroupName has_any (
+   "Domain Admins", "Enterprise Admins", "Schema Admins", 
+   "Administrators", "Backup Operators", "Account Operators",
+   "Server Operators", "Print Operators", "Cert Publishers"
+   )
+| extend Actor = Account
+| extend ActorDomain = extract(".*\\\\(.*)", 1, Actor)
+| project
+   TimeGenerated,
+   Computer,
+   EventID,
+   GroupName,
+   ModificationType,
+   AffectedAccount,
+   Actor,
+   ActorDomain,
+   EventData
+| extend Severity = case(
+   GroupName has_any ("Domain Admins", "Enterprise Admins", "Schema Admins"), "Critical",
+   GroupName has_any ("Administrators", "Backup Operators"), "High",
+   "Medium"
+)
+| extend Risk = case(
+   GroupName has "Domain Admins", "Critical - Domain Admin privileges could be misused for complete domain compromise",
+   GroupName has "Enterprise Admins", "Critical - Enterprise Admin rights could affect entire forest",
+   GroupName has "Schema Admins", "Critical - Schema modifications could impact AD structure",
+   GroupName has "Administrators", "High - Local admin rights could lead to system compromise",
+   "Medium - Privileged group modification requires investigation"
+)
+| extend RecommendedAction = strcat(
+   "1. Verify if modification to ", GroupName, " by ", Actor, " was authorized\n",
+   "2. Check change management tickets\n",
+   "3. Confirm compliance with security policies\n",
+   "4. Review actor's (", Actor, ") recent activities\n",
+   "5. If unauthorized, initiate incident response"
+)
+| extend 
+   TechniqueId = dynamic(["T1078.002", "T1484", "T1484.001"]),
+   TechniqueName = dynamic([
+       "Valid Accounts: Domain Accounts",
+       "Domain Policy Modification",
+       "Domain Policy Modification: Group Policy Modification"
+   ]),
+   ReferenceURL = dynamic([
+       "https://learn.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4728",
+       "https://attack.mitre.org/techniques/T1078/002/",
+       "https://attack.mitre.org/techniques/T1484/"
+   ])
+| order by TimeGenerated desc

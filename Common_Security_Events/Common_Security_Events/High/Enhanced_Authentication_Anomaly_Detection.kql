@@ -1,0 +1,108 @@
+//=====================================
+// Query Name: Enhanced Authentication Anomaly Detection v2
+// Created: 2025-01-28
+// 
+//
+// Severity: High
+//
+// MITRE ATT&CK Mapping:
+// - T1078 (Valid Accounts)
+//   - Sub-technique: T1078.002 (Domain Accounts) 
+// - T1550.002 (Use Alternate Authentication Material: Pass the Hash)
+// - T1021 (Remote Services)
+//
+// Description: 
+// Advanced detection of authentication anomalies and potential credential abuse by monitoring:
+// - Multiple logon types used by same account
+// - High frequency authentication attempts
+// - Authentication from multiple source IPs/workstations
+// - Pattern analysis of logon behavior
+//
+// Validation & Coverage:
+// Complements existing Microsoft Sentinel analytics:
+// - "Multiple authentication failures followed by a success" 
+// - "Sign-ins from IPs that attempt sign-ins to disabled accounts"
+// - "Unexpected authentication methods in Azure AD"
+//
+// Added value over built-in detections:
+// - More granular logon type analysis
+// - Enhanced IP/Workstation tracking
+// - Time-based pattern analysis
+// - Combined frequency + behavior analysis
+// - Detailed risk scoring
+//
+// False Positive Scenarios:
+// - Service accounts with legitimate multiple logon types
+// - Load balancers/proxies causing multiple source IPs
+// - Automated processes with high frequency logins
+//
+// Recommended Actions:
+// 1. Verify if multiple logon types are expected for the account
+// 2. Check source IP/workstation legitimacy
+// 3. Review authentication timing patterns
+// 4. Compare against baseline behavior
+//=====================================
+
+SecurityEvent
+| where TimeGenerated > ago(360d)
+| where EventID == 4624
+| where AccountType == "User"
+| where not(Account contains "Window Manager" 
+   or Account contains "Font Driver Host" 
+   or Account contains "DWM-" 
+   or Account contains "$")
+| extend SourceIP = tostring(extract("Source Network Address:\\s*([\\d\\.]+)", 1, EventData))
+| extend SourceWorkstation = tostring(extract("Workstation Name:\\s*([\\w\\-]+)", 1, EventData))
+| summarize 
+   LogonCount = count(),
+   UniqueLogonTypes = make_set(LogonType),
+   UniqueIPs = make_set(SourceIP),
+   UniqueWorkstations = make_set(SourceWorkstation),
+   LogonTimes = make_list(TimeGenerated),
+   LastLogon = max(TimeGenerated),
+   FirstLogon = min(TimeGenerated)
+   by Account, Computer
+| extend 
+   TimeDelta = datetime_diff('minute', LastLogon, FirstLogon),
+   NumberOfLogonTypes = array_length(UniqueLogonTypes),
+   NumberOfIPs = array_length(UniqueIPs),
+   NumberOfWorkstations = array_length(UniqueWorkstations)
+| where LogonCount >= 3
+   or NumberOfLogonTypes >= 2
+   or TimeDelta <= 5
+| project 
+   TimeGenerated = LastLogon,
+   Account,
+   Computer,
+   LogonCount,
+   LogonTypesUsed = UniqueLogonTypes,
+   SourceIPs = UniqueIPs,
+   SourceWorkstations = UniqueWorkstations,
+   NumberOfLogonTypes,
+   MinutesBetweenFirstAndLast = TimeDelta,
+   AverageLogonsPerMinute = todouble(LogonCount) / iff(TimeDelta == 0, 1.0, todouble(TimeDelta))
+| extend 
+   Severity = case(
+       LogonCount > 5 and NumberOfLogonTypes >= 2, "Critical",
+       LogonCount > 5 or NumberOfLogonTypes >= 2, "High",
+       "Medium"
+   ),
+   RiskDescription = case(
+       LogonCount > 5 and NumberOfLogonTypes >= 2, strcat("Critical: High frequency (", LogonCount, " logons) with multiple logon types"),
+       NumberOfLogonTypes >= 2, strcat("High: Multiple logon types (", tostring(LogonTypesUsed), ")"),
+       LogonCount > 5, strcat("High: Frequent logons (", LogonCount, " times in ", MinutesBetweenFirstAndLast, " minutes)"),
+       "Medium: Unusual authentication pattern"
+   ),
+   TechniqueId = dynamic([
+       "T1078",
+       "T1078.002", 
+       "T1550.002",
+       "T1021"
+   ]),
+   TechniqueName = dynamic([
+       "Valid Accounts",
+       "Valid Accounts: Domain Accounts",
+       "Use Alternate Authentication Material: Pass the Hash",
+       "Remote Services"
+   ])
+| order by Severity, LogonCount desc

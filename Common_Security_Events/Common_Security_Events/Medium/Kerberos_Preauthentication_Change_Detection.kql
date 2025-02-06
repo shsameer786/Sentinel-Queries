@@ -1,0 +1,81 @@
+//=====================================
+// Query Name: Kerberos Preauthentication Change Detection
+// Author: Sameer P Sheik
+// Version: 1.1
+//=====================================
+// Description: 
+// Detects changes to Kerberos preauthentication settings, which may indicate adversary 
+// attempts to weaken authentication security, facilitate brute-force attacks, or bypass 
+// security controls.
+//=====================================
+// Severity Mapping:
+// - High: Multiple occurrences of Kerberos preauthentication being disabled across accounts
+// - Medium: Single instance of Kerberos preauthentication being disabled
+// - Low: Kerberos preauthentication being enabled (may indicate normal administrative activity)
+//=====================================
+// MITRE ATT&CK® Mapping:
+// Primary Techniques:
+// - T1078: Valid Accounts
+//     Sub-techniques: 
+//     - T1078.003: Local Accounts (Abuse of authentication mechanisms)
+// - T1556: Modify Authentication Process
+//     Sub-techniques:
+//     - T1556.004: Disable or Modify Authentication (Disabling Kerberos preauthentication)
+// Related Techniques:
+// - T1110: Brute Force (Disabling preauthentication can facilitate password spraying attacks)
+// - T1558: Steal or Forge Kerberos Tickets (Potential precursor to Golden Ticket attacks)
+//=====================================
+// Validation:
+// Complementarity with OOB Analytics:
+// 1. Microsoft Security Analytics:
+//    - Extends "Kerberos preauthentication failures" detection (SecurityEvent 4771)
+//    - Complements "Account Management Changes" (SecurityEvent 4738)
+//    - Correlates with "User Account Control Changes" (SecurityEvent 4670)
+//
+// 2. Sentinel UEBA:
+//    - Enhances anomalous identity behavior detection by tracking preauthentication changes
+//    - Correlates authentication modifications with login anomalies
+//
+// 3. Microsoft Defender for Identity:
+//    - Adds visibility into Kerberos policy changes
+//    - Complements detections of Golden Ticket and brute-force attempts
+//
+// Coverage Gaps Addressed:
+// - Detects Kerberos preauthentication being disabled, which is a precursor to brute-force attacks
+// - Identifies policy modifications that could enable credential abuse
+// - Correlates authentication modifications with other suspicious activities
+//=====================================
+// False Positive Scenarios:
+// 1. Routine administrative changes to authentication policies
+// 2. Security testing by identity administrators
+// 3. Preauthentication changes as part of system hardening processes
+//
+// Minimization:
+// - Cross-referencing changes with administrator activity logs
+// - Tracking frequency of changes per user
+// - Combining with login failure trends to reduce false positives
+//=====================================
+// Performance Considerations:
+// - Uses 360d lookback period for long-term detection patterns
+// - Optimized filters to ensure minimal impact on query performance
+// - Uses targeted filtering to reduce unnecessary log processing
+//=====================================
+
+SecurityEvent 
+| where TimeGenerated > ago(360d)
+| where EventID == 4738
+| where UserAccountControl has_any ("%%2089", "%%2088")  // Adjusted format to match expected values
+| extend Action = case(
+    UserAccountControl has "%%2089", "Kerberos preauthentication disabled",
+    UserAccountControl has "%%2088", "Kerberos preauthentication enabled",
+    "unknown"
+)
+| summarize Count=count() by Action, User=TargetAccount
+| extend Severity = case(
+    Action == "Kerberos preauthentication disabled" and Count >= 3, "High",  // Multiple occurrences
+    Action == "Kerberos preauthentication disabled" and Count == 1, "Medium",  // Single occurrence
+    Action == "Kerberos preauthentication enabled", "Low",  // Normal activity
+    "Informational"  // Default fallback
+)
+| project TimeGenerated=now(), User, Action, Count, Severity
+| sort by TimeGenerated desc

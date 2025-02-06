@@ -1,0 +1,200 @@
+// Title: Enhanced RDP Connection Pattern Analysis and Monitoring
+// Author: Sameer P Sheik
+//
+// DESCRIPTION
+// -----------
+// Advanced detection for RDP connection patterns with risk scoring, 
+// analysis of connection timing, geographic locations, and potential lateral movement
+//
+// Data Connectors Required:
+// - Windows Security Events via AMA or Security Events via Legacy Agent
+//
+// MITRE ATT&CK Mapping
+// -------------------
+// Tactics:
+// - Initial Access (TA0001)
+//   * Remote services are used for initial access into network
+// - Lateral Movement (TA0008)
+//   * RDP used to move between systems
+// - Defense Evasion (TA0005)
+//   * Abnormal RDP patterns may indicate attempts to evade detection
+//
+// Techniques:
+// - T1021.001: Remote Desktop Protocol
+//   * Primary technique being monitored
+// - T1078: Valid Accounts
+//   * Use of legitimate credentials for RDP access
+// - T1110: Brute Force
+//   * Detection of multiple failed RDP attempts
+//
+// SEVERITY MAPPING
+// ---------------
+// Critical (Score: 60+):
+// - Multiple risk factors present
+// - High volume of failed attempts
+// - Unusual connection patterns from privileged accounts
+// - Evidence of potential lateral movement
+//
+// High (Score: 40-59):
+// - Unusual number of target systems
+// - High failure rates
+// - Sustained connection attempts
+// - Multiple non-work hour connections
+//
+// Medium (Score: 20-39):
+// - Moderate anomalies in connection patterns
+// - Privileged account accessing multiple systems
+// - Higher than normal daily connection rates
+//
+// Low (Score: 10-19):
+// - Minor deviations from baseline
+// - Low-volume anomalies
+// - Single suspicious pattern
+//
+// VALIDATION AGAINST OOB ANALYTICS
+// ------------------------------
+// 1. Microsoft Defender for Identity (MDI):
+// - Complements MDI's lateral movement detection
+// - Adds detailed RDP connection metrics not available in MDI
+// - Provides custom risk scoring for RDP patterns
+//
+// 2. Microsoft Sentinel Built-in Analytics:
+// - Extends "RDP Brute Force Attempts" analytic rule
+// - Adds behavior analytics not covered in default rules
+// - Provides deeper connection pattern analysis
+//
+// 3. Azure AD Sign-in Logs:
+// - Complements Azure AD sign-in risk detection
+// - Adds on-premises RDP context to cloud authentication
+// - Enables correlation between RDP and Azure AD activity
+//
+// FALSE POSITIVE ANALYSIS
+// ---------------------
+// 1. IT Support Activities:
+// - High volume of RDP during maintenance windows
+// - Multiple target systems for routine maintenance
+// - Regular after-hours support activities
+//
+// 2. Remote Work Patterns:
+// - Legitimate off-hours access from known locations
+// - Regular RDP usage from home offices
+// - Variable working hours across time zones
+//
+// 3. Automated Processes:
+// - Scheduled tasks using RDP
+// - Monitoring tools connections
+// - Backup system access
+//
+// ENHANCEMENT OPPORTUNITIES
+// -----------------------
+// 1. Geographic Correlation:
+// - Add IP geolocation data
+// - Track impossible travel scenarios
+// - Monitor cross-region access
+//
+// 2. Identity Context:
+// - Integrate with Azure AD roles
+// - Add user risk scores
+// - Track privileged identity usage
+//
+// 3. Behavioral Baseline:
+// - Develop per-user baselines
+// - Track seasonal patterns
+// - Identify role-based anomalies
+let lookback = 360d;                  // Analysis timeframe
+let timeSlice = 1h;                   // Time window for rate analysis
+let workHoursStart = 9;               // Define work hours for baseline
+let workHoursEnd = 17;
+let maxNormalDests = 20;              // Threshold for normal number of destinations
+let sustainedRateThreshold = 5;       // Connections per hour threshold
+let knownAdminAccounts = dynamic(["admin", "helpdesk", "support"]);  // Known admin patterns
+let excludedAccounts = dynamic(["service_account1", "system"]);      // Accounts to exclude
+let suspiciousIPRanges = dynamic(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]);  // Internal ranges to monitor;
+let rdpEvents = 
+    SecurityEvent
+    | where TimeGenerated > ago(lookback)
+    | where EventID in ("4624", "4625")   // Include both successful and failed logons
+    | where LogonType == 10               // RDP logons
+    | extend 
+        AccountName = tolower(Account),
+        SourceIP = IpAddress,
+        IsFailedLogon = EventID == "4625",
+        IsWorkHours = datetime_part("Hour", TimeGenerated) between (workHoursStart .. workHoursEnd)
+    | where AccountName !in (excludedAccounts);
+let accountMetrics = 
+    rdpEvents
+    | summarize
+        TotalConnections = count(),
+        SuccessfulConnections = countif(not(IsFailedLogon)),
+        FailedConnections = countif(IsFailedLogon),
+        UniqueComputers = dcount(Computer),
+        UniqueSourceIPs = dcount(SourceIP),
+        ComputerList = make_set(Computer),
+        SourceIPList = make_set(SourceIP),
+        FirstSeen = min(TimeGenerated),
+        LastSeen = max(TimeGenerated),
+        NonWorkHourConnections = countif(not(IsWorkHours)),
+        ConnectionDetails = make_list(pack("Computer", Computer, "Time", TimeGenerated, "SourceIP", SourceIP))
+        by AccountName;
+let connectionRates = 
+    rdpEvents
+    | summarize ConnectionsInWindow = count() by AccountName, bin(TimeGenerated, timeSlice)
+    | summarize 
+        MaxRatePerHour = max(ConnectionsInWindow),
+        AvgRatePerHour = avg(ConnectionsInWindow),
+        SustainedHighRateHours = countif(ConnectionsInWindow > sustainedRateThreshold)
+        by AccountName;
+// Final query combining all metrics
+accountMetrics
+| join kind=inner connectionRates on AccountName
+| extend 
+    DaysObserved = bin((LastSeen - FirstSeen) / 1d, 1),
+    ConnectionsPerDay = toreal(TotalConnections) / max_of(bin((LastSeen - FirstSeen) / 1d, 1), 1),
+    FailureRate = toreal(FailedConnections) / max_of(TotalConnections, 1),
+    IsPrivilegedAccount = AccountName has_any (knownAdminAccounts)
+| extend RiskScore = case(
+    UniqueComputers > maxNormalDests, 40,                       // Unusual number of destinations
+    FailureRate > 0.4, 30,                                      // High failure rate
+    SustainedHighRateHours > 24, 25,                           // Sustained high rate
+    NonWorkHourConnections > TotalConnections * 0.5, 20,        // Majority non-work hours
+    IsPrivilegedAccount and UniqueComputers > 10, 15,          // Privileged account with many destinations
+    ConnectionsPerDay > 50, 10,                                 // High daily rate
+    0                                                           // Default score
+)
+| extend RiskLevel = case(
+    RiskScore > 60, "Critical",
+    RiskScore > 40, "High",
+    RiskScore > 20, "Medium",
+    RiskScore > 10, "Low",
+    "Informational"
+)
+| extend AlertRecommendation = case(
+    RiskScore > 60, "Critical: Investigate possible account compromise or misuse",
+    RiskScore > 40, "High: Review unusual RDP connection patterns",
+    RiskScore > 20, "Medium: Validate if connection patterns align with business needs",
+    RiskScore > 10, "Low: Monitor for changes in baseline behavior",
+    "Informational: Normal RDP usage pattern"
+)
+| project
+    TimeGenerated = LastSeen,
+    AccountName,
+    RiskLevel,
+    RiskScore,
+    TotalConnections,
+    SuccessfulConnections,
+    FailedConnections,
+    UniqueComputers,
+    UniqueSourceIPs,
+    MaxRatePerHour,
+    AvgRatePerHour,
+    NonWorkHourConnections,
+    DaysObserved,
+    ConnectionsPerDay,
+    FailureRate,
+    FirstSeen,
+    LastSeen,
+    ComputerList,
+    SourceIPList,
+    ConnectionDetails,
+    AlertRecommendation
+| sort by RiskScore desc, TotalConnections desc
