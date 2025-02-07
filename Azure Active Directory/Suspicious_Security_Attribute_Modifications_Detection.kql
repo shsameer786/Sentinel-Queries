@@ -1,0 +1,96 @@
+//*******************************************************************************************
+// Title: Suspicious Security Attribute Modifications Detection
+//*******************************************************************************************
+// Author: Sameer P Sheik
+// Description: 
+// Detects potentially suspicious modifications to security attributes in Azure AD
+// focusing on privilege escalation and permission changes.
+//*******************************************************************************************
+// MITRE ATT&CK Mapping:
+// - Tactic: Persistence (TA0003)
+// - Technique: Account Manipulation (T1098)
+// - Sub-technique: Additional Cloud Credentials (T1098.001)
+//*******************************************************************************************
+// Severity Classification:
+// - High (RiskScore = 3): Sensitive attribute modifications (PCI, HIPAA, Admin, Privileged)
+// - Medium (RiskScore = 2): New attribute additions
+// - Low (RiskScore = 1): Standard modifications
+//*******************************************************************************************
+// Validation against Microsoft Sentinel Analytics:
+// - Complements: "Admin added to privileged role outside of PIM"
+// - Extends: "Changes to privileged groups"
+// - New Coverage: Fine-grained attribute-level monitoring
+//*******************************************************************************************
+// False Positive Scenarios:
+// - Legitimate bulk updates during system maintenance
+// - Approved security attribute modifications by authorized admins
+// - PIM-activated administrative actions
+//*******************************************************************************************
+// Required Data Connector: Azure Active Directory - Audit Logs
+// Data Type: AuditLogs
+// Minimum DataLatency: 15m
+// Minimum Period: 14d
+//*******************************************************************************************
+// Version: 1.1
+// Last Updated: 2024-02-07
+//*******************************************************************************************
+AuditLogs
+| where TimeGenerated > ago(14d)
+| where OperationName in ("Update attribute values assigned to a user", "Add attribute values to a user", "Remove attribute values from a user")
+| extend ModifiedProperties = parse_json(tostring(TargetResources[0].modifiedProperties))
+| mv-expand ModifiedProperty = ModifiedProperties
+| extend AttributeDisplayName = tostring(ModifiedProperty.displayName)
+| extend NewValue = tostring(parse_json(tostring(ModifiedProperty.newValue))[0])
+| extend OldValue = tostring(parse_json(tostring(ModifiedProperty.oldValue))[0])
+| extend Target = tostring(TargetResources[0].userPrincipalName)
+| extend ActorInfo = parse_json(tostring(InitiatedBy.user))
+| extend Actor = tostring(ActorInfo.userPrincipalName)
+| extend ActorIPAddress = tostring(ActorInfo.ipAddress)
+| where Actor !in ("system@microsoft.com", "sync_service@microsoft.com")
+| parse AttributeDisplayName with * '.' ['Attribute Set Name'] "_" *
+| extend ["Attribute Name"] = split(AttributeDisplayName, "_")[1]
+| extend ["Change Type"] = case(
+    isempty(OldValue) and isnotempty(NewValue), "Added",
+    isnotempty(OldValue) and isempty(NewValue), "Removed",
+    "Modified"
+)
+| extend IsSensitiveAttribute = ["Attribute Name"] has_any("PCI", "HIPAA", "Admin", "Privileged")
+| extend CurrentRiskScore = case(
+    IsSensitiveAttribute, 3,
+    ['Change Type'] == "Added", 2,
+    1
+)
+| extend AlertSeverity = case(
+    CurrentRiskScore == 3, "High",
+    CurrentRiskScore == 2, "Medium",
+    "Low"
+)
+| extend TTPTactic = "Persistence"
+| extend TTPTechnique = "Account Manipulation"
+| extend TTPSubTechnique = "Additional Cloud Credentials"
+| summarize 
+    AttributeChanges = count(),
+    SensitiveChanges = countif(IsSensitiveAttribute),
+    DistinctTargets = dcount(Target),
+    LastChange = max(TimeGenerated),
+    AttributesList = make_set(['Attribute Name']),
+    IPAddresses = make_set(ActorIPAddress),
+    MaxRiskScore = max(CurrentRiskScore),
+    Severity = max(AlertSeverity)
+    by Actor, bin(TimeGenerated, 1h), TTPTactic, TTPTechnique, TTPSubTechnique
+| where AttributeChanges > 10 or SensitiveChanges > 0
+| project
+    TimeGenerated,
+    Actor,
+    AttributeChanges,
+    SensitiveChanges,
+    DistinctTargets,
+    LastChange,
+    AttributesList,
+    IPAddresses,
+    MaxRiskScore,
+    Severity,
+    TTPTactic,
+    TTPTechnique,
+    TTPSubTechnique
+| order by MaxRiskScore desc
