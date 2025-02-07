@@ -1,0 +1,119 @@
+//*******************************************************************************************
+// Title: Advanced Detection of Domain Policy Changes in Azure AD External Identities
+//*******************************************************************************************
+// Description: This detection monitors and analyzes changes to allow/block lists in Azure AD external identities,
+// tracking modifications to domain policies that could indicate potential security risks or unauthorized access attempts.
+//*******************************************************************************************
+// Data Connector Required: Azure Active Directory - Audit Logs
+//*******************************************************************************************
+// Severity: Medium
+//*******************************************************************************************
+// MITRE ATT&CK Tactics and Techniques:
+// - Persistence (TA0003)
+//   - Account Manipulation (T1098)
+//   - Account Manipulation: Additional Cloud Credentials (T1098.001)
+// - Defense Evasion (TA0005)
+//   - Modify Authentication Process (T1556)
+// - Initial Access (TA0001)
+//   - Valid Accounts: Cloud Accounts (T1078.004)
+//*******************************************************************************************
+// Risk Assessment:
+// - Impact: High - Changes to domain allow/block lists can significantly affect external access
+// - Probability: Medium - Requires privileged access but could be exploited
+//*******************************************************************************************
+// Alert Trigger: 
+// - Triggers on modifications to domain allow/block lists in Azure AD external identities
+// - Specific focus on high-risk changes like removal from block lists
+//*******************************************************************************************
+// Investigation Steps:
+// 1. Verify if the change was authorized and made by a legitimate admin
+// 2. Check if the change aligns with organizational security policies
+// 3. Review the specific domains added/removed
+// 4. Analyze the actor's location and IP address for anomalies
+// 5. Correlate with other security events in the same timeframe
+//*******************************************************************************************
+// False Positive Scenarios:
+// - Legitimate administrative changes to domain policies
+// - Bulk policy updates during tenant migrations
+// - Automated policy updates by approved applications
+//*******************************************************************************************
+// Validation Rules:
+// - Complementary to Microsoft Defender for Cloud Apps alerts
+// - Extends Microsoft Sentinel AAD Built-in Analytics
+// - Cross-reference with:
+//   * "Adding conditional access policy" built-in rule
+//   * "Creation of external accounts by end users" rule
+//   * "Multiple Password Reset attempts" analytics
+//*******************************************************************************************
+// Response Playbook Recommendations:
+// 1. Immediate notification to security team for high-risk changes
+// 2. Automatic ticket creation for investigation
+// 3. Optional policy reversion for unauthorized changes
+//*******************************************************************************************
+// Version: 1.0
+// Last Updated: 2025-02-07
+// Author: Sameer P Sheik
+//*******************************************************************************************
+let timeframe = 360d;  // Adjustable time window
+let relevantOperations = dynamic(["Update policy", "Add policy", "Delete policy"]);
+AuditLogs
+| where TimeGenerated > ago(timeframe)
+| where OperationName in (relevantOperations)
+| extend 
+    Actor = tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName),
+    ActorIPAddress = tostring(parse_json(tostring(InitiatedBy.user)).ipAddress),
+    ActorLocation = tostring(parse_json(tostring(InitiatedBy.user)).city)
+| mv-expand TargetResources
+| extend 
+    modifiedProperties = parse_json(TargetResources).modifiedProperties,
+    ResourceId = tostring(TargetResources.id),
+    ResourceType = tostring(TargetResources.type)
+| mv-expand modifiedProperties  
+| extend 
+    newValue = parse_json(modifiedProperties).newValue,
+    oldValue = parse_json(modifiedProperties).oldValue,
+    displayName = tostring(parse_json(modifiedProperties).displayName),
+    propertyName = tostring(parse_json(modifiedProperties).propertyName)
+| mv-expand todynamic(newValue) to typeof(string)
+| mv-expand todynamic(oldValue) to typeof(string)
+| where newValue has "InvitationsAllowedAndBlockedDomainsPolicy" or oldValue has "InvitationsAllowedAndBlockedDomainsPolicy"
+| extend 
+    ChangeType = case(
+        isempty(oldValue) and isnotempty(newValue), "Domain Added",
+        isnotempty(oldValue) and isempty(newValue), "Domain Removed",
+        oldValue != newValue, "Domain Policy Modified",
+        "No Change"
+    )
+| extend 
+    PolicyType = case(
+        newValue has "AllowedDomains", "Allow List",
+        newValue has "BlockedDomains", "Block List",
+        "Unknown"
+    )
+| extend 
+    DomainName = extract(@"['""]([^'""]+)['""]", 1, newValue),
+    ActionTaken = strcat(ChangeType, " to ", PolicyType)
+| extend
+    RiskLevel = case(
+        PolicyType == "Block List" and ChangeType == "Domain Removed", "High",
+        PolicyType == "Allow List" and ChangeType == "Domain Added", "Medium",
+        "Low"
+    )
+| where isnotempty(DomainName)
+| project
+    TimeGenerated,
+    OperationName,
+    Actor,
+    ActorIPAddress,
+    ActorLocation,
+    ActionTaken,
+    DomainName,
+    PolicyType,
+    ChangeType,
+    RiskLevel,
+    ['Previous Value'] = oldValue,
+    ['New Value'] = newValue,
+    ResourceId,
+    ResourceType,
+    CorrelationId
+| sort by TimeGenerated desc

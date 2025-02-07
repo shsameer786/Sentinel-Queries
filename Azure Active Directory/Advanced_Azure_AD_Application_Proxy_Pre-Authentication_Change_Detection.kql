@@ -1,0 +1,163 @@
+//***************************************************************************************************
+// Title: Advanced Azure AD Application Proxy Pre-Authentication Change Detection
+// Description: Detects changes to Azure AD Application Proxy pre-authentication settings with focus on high-risk "Pass Through" configurations
+// Author: Sameer P Sheik
+//***************************************************************************************************
+// MITRE ATT&CK Mapping:
+// Tactics:
+//   - Initial Access (TA0001)
+//   - Defense Evasion (TA0005)
+//   - Persistence (TA0003)
+//***************************************************************************************************
+// Techniques:
+//   - Valid Accounts (T1078)
+//       - Cloud Accounts (T1078.004)
+//   - Trusted Relationship (T1199)
+//   - Modify Authentication Process (T1556)
+//       - Authentication Policy Modification (T1556.006)
+//***************************************************************************************************
+// Severity: High
+// Risk Impact: Critical - Pass-through authentication may expose internal resources to unauthenticated access
+//***************************************************************************************************
+// Alert Details:
+// - Severity: High
+// - CVSS Score Range: 8.0-9.0
+// - Asset Criticality: Critical
+// - Data Sensitivity: High
+//***************************************************************************************************
+// Rule Validation and Coverage Analysis:
+//***************************************************************************************************
+// 1. Correlation with Existing Analytics:
+//    - Complements "OAuth apps accessing Azure AD - Authentication methods modification" (ID: b7f3e266-28f3-4aeb-a2c3-0fff2af31ba4)
+//    - Extends "Adding OAuth permission grant" (ID: 2157e57b-ca55-4839-8546-ed0453ee05f1)
+//    - Supplements "Authentication methods changed for Azure AD" analytics
+//***************************************************************************************************
+// 2. Coverage Gaps Addressed:
+//    - Specific focus on Application Proxy pre-auth changes not covered by OOB rules
+//    - Enhanced detection of pass-through authentication risks
+//    - Addition of location and IP-based anomaly detection
+//    - Tracking of configuration state changes
+//***************************************************************************************************
+// 3. False Positive Analysis:
+//    - Known scenarios:
+//      * Legitimate admin configuration during app deployment
+//      * Bulk updates during tenant migration
+//      * Automated policy updates by approved services
+//    - Mitigation: Use IsKnownAdminIP and IsKnownLocation filters
+//***************************************************************************************************
+// 4. Enrichment Sources:
+//    - Azure AD Identity Protection
+//    - Azure AD Sign-in Logs
+//    - Azure AD Audit Logs
+//***************************************************************************************************
+// 5. Performance Considerations:
+//    - Query optimized for 360-day retention
+//    - Efficient use of parse_json for nested properties
+//    - Minimal use of expensive operations
+//***************************************************************************************************
+// Response Playbook Integration:
+//***************************************************************************************************
+// 1. Immediate Actions:
+//    - High Risk (AnomalyScore >= 3):
+//      * Trigger immediate security team notification
+//      * Create high-priority incident ticket
+//      * Optional automated reversion of changes
+//***************************************************************************************************
+// 2. Investigation Steps:
+//    - Medium Risk (AnomalyScore >= 1):
+//      * Review change authorization
+//      * Verify business justification
+//      * Document approval status
+//***************************************************************************************************
+// 3. Remediation:
+//    - Review and update allowed admin IPs
+//    - Validate authentication policies
+//    - Update security baseline documentation
+//***************************************************************************************************
+AuditLogs
+| where TimeGenerated > ago(360d)
+| where LoggedByService == "Application Proxy"
+| where OperationName in ("Update application", "Add application", "Add service principal")
+| where Result == "success"
+| extend
+    Actor = tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName),
+    ActorIPAddress = tostring(parse_json(tostring(InitiatedBy.user)).ipAddress),
+    ActorLocation = tostring(parse_json(tostring(InitiatedBy.user)).city),
+    ActorCountry = tostring(parse_json(tostring(InitiatedBy.user)).countryOrRegion),
+    ActorRole = tostring(parse_json(tostring(InitiatedBy.user)).role),
+    AppObjectId = tostring(TargetResources[0].id),
+    AppDisplayName = tostring(TargetResources[0].displayName)
+| mv-expand TargetResources
+| extend 
+    modifiedProperties = parse_json(TargetResources).modifiedProperties
+| mv-expand modifiedProperties
+| extend
+    PropertyName = tostring(modifiedProperties.displayName),
+    NewValue = tostring(parse_json(tostring(modifiedProperties.newValue))),
+    OldValue = tostring(parse_json(tostring(modifiedProperties.oldValue)))
+| where PropertyName == "PreAuthentication" or PropertyName contains "PreAuth"
+| extend 
+    PreAuthSetting = case(
+        NewValue == "Passthru", "Pass Through",
+        NewValue == "Azure AD", "Azure AD",
+        NewValue == "", "Not Configured",
+        NewValue
+    )
+| extend
+    RiskLevel = case(
+        PreAuthSetting == "Pass Through", "High",
+        PreAuthSetting == "Not Configured", "Medium",
+        "Low"
+    ),
+    IsKnownAdminIP = ActorIPAddress in ("10.0.0.1", "10.0.0.2"),  // Example IPs - customize
+    IsKnownLocation = ActorCountry in ("US", "GB"),  // Example locations - customize
+    ChangeType = case(
+        isempty(OldValue) and isnotempty(NewValue), "New Configuration",
+        OldValue == NewValue, "No Change",
+        "Configuration Modified"
+    )
+| extend
+    AnomalyScore = toint(case(
+        RiskLevel == "High" and not(IsKnownAdminIP), 3.0,
+        RiskLevel == "High" and not(IsKnownLocation), 2.0,
+        RiskLevel == "High", 1.0,
+        RiskLevel == "Medium", 0.5,
+        0.1
+    ))
+| extend
+    AlertName = strcat("Azure AD App Proxy - ", PreAuthSetting, " Pre-Auth Setting Detected"),
+    AlertDetails = strcat(
+        "Application '", AppDisplayName, 
+        "' was configured with ", PreAuthSetting,
+        " pre-authentication by ", Actor,
+        " from ", coalesce(ActorLocation, "Unknown Location"),
+        " (", ActorIPAddress, ")"
+    )
+| project
+    TimeGenerated,
+    AlertName,
+    AlertDetails,
+    RiskLevel,
+    AnomalyScore,
+    AppDisplayName,
+    AppObjectId,
+    PreAuthSetting,
+    ChangeType,
+    Actor,
+    ActorIPAddress,
+    ActorLocation,
+    ActorCountry,
+    ActorRole,
+    IsKnownAdminIP,
+    IsKnownLocation,
+    ['Previous Setting'] = OldValue,
+    ['New Setting'] = NewValue,
+    OperationName,
+    CorrelationId
+| sort by AnomalyScore desc, TimeGenerated desc
+//***************************************************************************************************
+// Version History:
+// v1.0 - Initial release
+// v1.1 - Added anomaly scoring
+// v1.2 - Enhanced MITRE mapping and validation
+//***************************************************************************************************

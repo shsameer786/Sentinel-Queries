@@ -1,0 +1,158 @@
+//*******************************************************************************
+// Enhanced Detection: Azure AD Entitlement Package Creation, Modification, and Assignment (Corrected) with Severity, MITRE ATT&CK, and OOB Rule Validation
+//*******************************************************************************
+// Author: Sameer P Sheik
+//*******************************************************************************
+// Description: This query detects the creation, modification, and assignment of Azure AD Entitlement Packages.
+//    It includes detailed information extraction, risk scoring, severity levels, and MITRE ATT&CK mapping.
+//*******************************************************************************
+// Data Connectors Required:
+//    - Azure Active Directory - Audit Logs
+//    - Azure Active Directory - Signin Logs (Optional, for enhanced user context)
+//    - Azure Active Directory - Identity Protection (Optional, for user risk information)
+//*******************************************************************************
+// Severity Levels:
+//    - High: Creation of hidden packages, modifications to existing packages with high-risk users, assignments to high-risk users.
+//    - Medium: Creation of non-hidden packages, modifications to existing packages, assignments to users with some risk.
+//    - Low: Assignments to low-risk users.
+//*******************************************************************************
+// MITRE ATT&CK Mapping:
+//    - T1136.003 - Create Account: Cloud Account (Creation of Entitlement Packages)
+//    - T1098 - Account Manipulation (Modification of Entitlement Packages and Assignments)
+//    - T1078.004 - Valid Accounts: Cloud Accounts (Assignment to potentially compromised accounts)
+//    - T1530 - Data from Cloud Storage Object (If packages include access to storage resources) - *Consider adding logic to detect this specifically*
+//    - T1612 - Account Use Policies (If packages violate existing policies) - *Consider adding policy comparison*
+//*******************************************************************************
+let timeframe = 360d;  //Using a large number here for testing - change to a reasonable value like 1d or 7d in production!
+//*******************************************************************************
+AuditLogs
+| where TimeGenerated > ago(timeframe)
+| where OperationName in ("Create access package", "Update access package", "Add accessPackageAssignmentRequest")
+| where TargetResources[0].type == "AccessPackage" or TargetResources[0].type == "accessPackageAssignmentRequest"
+| extend AccessPackageName = tostring(TargetResources[0].displayName)
+| extend AccessPackageId = tostring(TargetResources[0].id)
+//*******************************************************************************
+// Actor Information
+//*******************************************************************************
+//*******************************************************************************
+
+| extend InitiatedBy = iff(isnotempty(InitiatedBy.user), tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName), tostring(InitiatedBy.app.servicePrincipalName))
+| extend ActorUPN = tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName)
+| extend ActorObjectId = tostring(parse_json(tostring(InitiatedBy.user)).id)
+| extend ActorAppId = tostring(parse_json(tostring(InitiatedBy.app)).appId)
+| extend ActorServicePrincipalName = tostring(parse_json(tostring(InitiatedBy.app)).servicePrincipalName)
+| extend ActorIpAddress = tostring(parse_json(tostring(InitiatedBy.user)).ipAddress)
+//*******************************************************************************
+// Access Package Details (Creation/Update)
+//*******************************************************************************
+//
+| extend AccessPackageDetails = iff(OperationName in ("Create access package", "Update access package"), dynamic(TargetResources[0].modifiedProperties), dynamic(null))
+| extend PackageDescription = tostring(parse_json(tostring(AccessPackageDetails))[0].newValue)
+| extend IsHidden = tobool(parse_json(tostring(AccessPackageDetails))[1].newValue)
+| extend CatalogId = tostring(parse_json(tostring(AccessPackageDetails))[2].newValue)
+//*******************************************************************************
+// Access Package Assignment Details (Assignment) - CORRECTED LOGIC
+//*******************************************************************************
+| extend RequestType = tostring(parse_json(tostring(AdditionalDetails[0].value)))
+| extend TargetUserObjectId = iff(OperationName == "Add accessPackageAssignmentRequest",
+    // 1. Parse TargetResources into a dynamic object:
+    tostring(
+        parse_json(tostring(TargetResources)) //Corrected- Added tostring() here
+        // 2. Filter the dynamic array to find elements where type == "User":
+        | mv-expand TargetResources  // Expand the dynamic array into individual rows
+        | where TargetResources.type == "User"
+        // 3. Extract the 'id' property, using arg_max to handle potential duplicates:
+        | summarize TargetUserId = arg_max(TimeGenerated, tostring(TargetResources.id))
+    )
+    , "")  // Default to empty string if not an assignment request
+| extend TargetUserUPN = iff(OperationName == "Add accessPackageAssignmentRequest",
+//*******************************************************************************
+// 1. Parse TargetResources (same as above):
+//*******************************************************************************
+    tostring(
+       parse_json(tostring(TargetResources)) //Corrected - Added tostring() here
+        // 2. Filter for type == "User":
+        | mv-expand TargetResources
+        | where TargetResources.type == "User"
+        // 3. Extract the 'displayName' property:
+        | summarize TargetUserDisplayName = arg_max(TimeGenerated, tostring(TargetResources.displayName))
+    )
+    , "")
+//*******************************************************************************
+// Target User Risk (Join)
+//*******************************************************************************
+| join kind=leftouter (
+    AADUserRiskEvents
+    | where TimeGenerated > ago(timeframe)
+    | summarize RiskScore = max(RiskLevel) by UserId
+) on $left.TargetUserObjectId == $right.UserId
+| extend TargetUserRiskScore = iff(isnotnull(RiskScore), RiskScore, 0)
+//*******************************************************************************
+// Actor Signin Information (Join)
+//*******************************************************************************
+| join kind=leftouter (
+    SigninLogs
+    | where TimeGenerated > ago(timeframe)
+    | where UserPrincipalName != ""
+    | summarize arg_max(TimeGenerated, *) by UserPrincipalName
+) on $left.ActorUPN == $right.UserPrincipalName
+| extend ActorLocation = iff(isnotempty(LocationDetails), tostring(LocationDetails.city) + ", " + tostring(LocationDetails.state) + ", " + tostring(LocationDetails.countryOrRegion), "")
+| extend ActorIpAddress = iff(isnotempty(IPAddress) and isempty(ActorIpAddress), IPAddress, ActorIpAddress)
+//*******************************************************************************
+// Risk Score Calculation
+//*******************************************************************************
+| extend RiskScore = case(
+    OperationName == "Create access package", 10,
+    OperationName == "Update access package", 5,
+    OperationName == "Add accessPackageAssignmentRequest", 2,
+    0
+  )
+| extend RiskScore = RiskScore + iff(IsHidden == true, 10, 0)
+| extend RiskScore = RiskScore + iff(TargetUserRiskScore > 0, TargetUserRiskScore * 5, 0)
+| extend RiskScore = RiskScore + iff(ActorLocation != "" and isnotempty(ActorLocation), 5, 0)
+| extend RiskScore = RiskScore + iff(isempty(ActorAppId), 0, 5)
+//*******************************************************************************
+// Severity and MITRE ATT&CK Mapping
+//*******************************************************************************
+| extend Severity = case(
+    RiskScore >= 20, "High",
+    RiskScore >= 10, "Medium",
+    RiskScore > 0, "Low",
+    "Informational"
+  )
+| extend MitreTechniques = case(
+    OperationName == "Create access package", "T1136.003", // Cloud Account Creation
+    OperationName == "Update access package", "T1098",   // Account Manipulation
+    OperationName == "Add accessPackageAssignmentRequest", "T1078.004", // Valid Accounts: Cloud Accounts
+    ""
+  )
+| extend MitreTechniques = strcat(MitreTechniques, case(TargetUserRiskScore > 0, ",T1078.004", "")) //Add if risky user is the target
+//*******************************************************************************
+// Project Relevant Fields
+//*******************************************************************************
+| project
+    TimeGenerated,
+    OperationName,
+    RequestType,
+    AccessPackageName,
+    AccessPackageId,
+    PackageDescription,
+    IsHidden,
+    CatalogId,
+    ActorUPN,
+    ActorObjectId,
+    ActorAppId,
+    ActorServicePrincipalName,
+    ActorIpAddress,
+    ActorLocation,
+    TargetUserUPN,
+    TargetUserObjectId,
+    TargetUserRiskScore,
+    RiskScore,
+    Severity,
+    MitreTechniques,
+    Resources,
+    InitiatedBy,
+    TargetResources,
+    AdditionalDetails
+| sort by TimeGenerated desc

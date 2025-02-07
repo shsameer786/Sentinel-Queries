@@ -1,0 +1,241 @@
+// Title: Advanced Detection for High-Risk Activities by Privileged Users with MITRE ATT&CK Mapping
+// Purpose: Enhanced monitoring of high-risk activities from privileged users with advanced threat detection
+//************************************************************************************************************
+// Author: Sameer P Sheik
+// Version: 1.0
+// Last Updated: 2024-02-07
+//************************************************************************************************************
+// Query Type: Behavioral Analytics, Identity Security
+// Category: Privilege Abuse, Identity & Access
+//************************************************************************************************************
+// Description:
+// This detection identifies high-risk activities performed by users who have activated privileged roles
+// through Azure AD PIM within the last 60 days. It correlates this with sign-in risk data and suspicious activities
+// to identify potential compromised privileged accounts or insider threats.
+//************************************************************************************************************
+// Severity: High
+// - Critical: Risk score >= 80 (Immediate investigation required)
+// - High: Risk score >= 60 (Investigation required within 4 hours)
+// - Medium: Risk score >= 40 (Investigation required within 24 hours)
+// - Low: Risk score < 40 (Review during regular security monitoring)
+//************************************************************************************************************
+// MITRE ATT&CK Mapping:
+// - Tactic: Initial Access (TA0001)
+//   * Technique: Valid Accounts (T1078)
+//   * Sub-technique: Cloud Accounts (T1078.004)
+//************************************************************************************************************
+// - Tactic: Privilege Escalation (TA0004)
+//   * Technique: Valid Accounts (T1078)
+//   * Sub-technique: Admin Accounts (T1078.002)
+//************************************************************************************************************
+// - Tactic: Defense Evasion (TA0005)
+//   * Technique: Valid Accounts (T1078)
+//************************************************************************************************************
+// - Tactic: Persistence (TA0003)
+//   * Technique: Account Manipulation (T1098)
+//   * Sub-technique: Additional Cloud Credentials (T1098.001)
+//************************************************************************************************************
+// Required Data Connectors:
+// - Azure Active Directory - Audit Logs (M365D-Identity-AuditLogs)
+// - Azure Active Directory - SignIn Logs (M365D-Identity-SignInLogs)
+//************************************************************************************************************
+// Trigger Conditions:
+// 1. Privileged role activation through PIM
+// 2. High-risk sign-in events
+// 3. Suspicious activity patterns
+// 4. Multiple failed authentication attempts
+// 5. Out-of-hours activity
+//************************************************************************************************************
+// Risk Scoring Factors:
+// - Base Risk:
+//   * Anonymized/Malicious IP (90 points)
+//   * Unfamiliar features/Suspicious user agent (70 points)
+//   * Impossible travel/New country (60 points)
+//   * Admin confirmed compromise (85 points)
+//   * Other suspicious patterns (40 points)
+//************************************************************************************************************
+// - Risk Modifiers:
+//   * Outside business hours (+10 points)
+//   * Multiple failed attempts (+15 points)
+//   * Multiple risk events (+20 points)
+//   * New/Unmanaged device (+5 points)
+//   * Non-passwordless auth (+5 points)
+//************************************************************************************************************
+// Validation:
+// Complementary to following Microsoft built-in detections:
+// - Identity: Suspicious application consent (AlertID: 7b66c06c-94e3-4a45-8296-9320f3e4d3bc)
+// - Identity: Attempt to bypass MFA (AlertID: 9bc0e890-0bf6-4432-9910-4f87e421bd8d)
+// - Identity: Suspicious sign-in properties (AlertID: f2dd020c-5cc8-45a4-a34f-9e34dd3c5c10)
+//************************************************************************************************************
+// This detection provides additional context by:
+// 1. Focusing specifically on privileged role holders
+// 2. Including PIM activation context
+// 3. Providing detailed risk scoring
+// 4. Correlating multiple data sources
+//************************************************************************************************************
+// False Positive Scenarios:
+// 1. Legitimate off-hours access by IT administrators
+// 2. Planned maintenance activities
+// 3. Emergency response activities
+// 4. Global organizations with users in different time zones
+//************************************************************************************************************
+// Response Playbook Reference:
+// 1. Immediate response for Critical severity:
+//    - Disable affected account
+//    - Review all recent activities
+//    - Check for unauthorized role assignments
+//************************************************************************************************************
+// 2. High severity response:
+//    - Review authentication patterns
+//    - Validate PIM activation justifications
+//    - Check for policy modifications
+//************************************************************************************************************
+// 3. Medium/Low severity response:
+//    - Monitor for escalation
+//    - Review during standard security checks
+//    - Update baseline if legitimate
+//************************************************************************************************************
+// Main Query
+AuditLogs
+| where TimeGenerated > ago(7d)
+| mv-expand ParsedFields = parse_json(TargetResources)
+| extend 
+    Target = tostring(ParsedFields.userPrincipalName),
+    DisplayName = tostring(ParsedFields.displayName),
+    ResourceId = tostring(ParsedFields.id),
+    ModifiedProperties = parse_json(tostring(ParsedFields.modifiedProperties)),
+    ActivityTime = TimeGenerated,
+    ActivityHour = datetime_part("Hour", TimeGenerated),
+    IsOutsideBusinessHours = datetime_part("Hour", TimeGenerated) < 9 or datetime_part("Hour", TimeGenerated) > 17
+| join kind=inner (
+    SigninLogs
+    | where TimeGenerated > ago(7d)
+    | where RiskLevelDuringSignIn == "high"
+    | extend 
+        LocationDetails = parse_json(LocationDetails),
+        DeviceDetail = parse_json(DeviceDetail),
+        AuthenticationDetails = parse_json(AuthenticationDetails),
+        RiskEventTypes = parse_json(RiskEventTypes)
+    | extend 
+        City = tostring(LocationDetails.city),
+        Country = tostring(LocationDetails.countryOrRegion),
+        DeviceBrowser = tostring(DeviceDetail.browser),
+        DeviceOS = tostring(DeviceDetail.operatingSystem),
+        AuthMethod = tostring(AuthenticationDetails[0].authenticationMethod),
+        IsNewDevice = tostring(DeviceDetail.isCompliant),
+        RiskEvents = array_length(RiskEventTypes)
+    | project 
+        TimeGenerated,
+        UserPrincipalName,
+        UserDisplayName,
+        RiskDetail,
+        RiskLevelDuringSignIn,
+        RiskState,
+        RiskEvents,
+        AuthMethod,
+        City,
+        Country,
+        IPAddress,
+        DeviceBrowser,
+        DeviceOS,
+        IsNewDevice
+) on $left.DisplayName == $right.UserDisplayName
+| where UserPrincipalName in (
+    AuditLogs 
+    | where TimeGenerated > ago(60d)
+    | where ActivityDisplayName == 'Add member to role completed (PIM activation)'
+    | where Category == "RoleManagement" 
+    | extend 
+        Caller = tostring(InitiatedBy.user.userPrincipalName),
+        Role = tostring(TargetResources[0].displayName)
+    | where Role in~ ('Global Administrator', 
+                     'Privileged Role Administrator',
+                     'Privileged Authentication Administrator',
+                     'Security Administrator',
+                     'Exchange Administrator',
+                     'SharePoint Administrator',
+                     'Application Administrator',
+                     'Authentication Administrator',
+                     'Cloud Application Administrator',
+                     'Conditional Access Administrator',
+                     'Helpdesk Administrator',
+                     'Hybrid Identity Administrator',
+                     'Password Administrator',
+                     'User Administrator')
+    | extend RiskLevel = case(
+        Role in~ ('Global Administrator', 'Privileged Role Administrator', 'Privileged Authentication Administrator'), 5,
+        Role in~ ('Security Administrator', 'Exchange Administrator', 'SharePoint Administrator', 'Application Administrator'), 4,
+        Role in~ ('Authentication Administrator', 'Cloud Application Administrator', 'Conditional Access Administrator'), 3,
+        2 // Default risk level for other admin roles
+    )
+    | distinct Caller
+)
+| join kind=leftouter (
+    SigninLogs
+    | where TimeGenerated > ago(7d)
+    | where ResultType !in ("0", "50125", "50140")
+    | summarize 
+        FailedCount=count(), 
+        FailedResults=make_set(ResultType),
+        LastFailedTime=max(TimeGenerated)
+        by UserPrincipalName
+) on UserPrincipalName
+| extend BaseRiskScore = case(
+    RiskDetail has_any ("anonymizedIPAddress", "maliciousIPAddress"), 90,
+    RiskDetail has_any ("unfamiliarFeatures", "suspiciousUserAgent"), 70,
+    RiskDetail has_any ("impossibleTravel", "newCountry"), 60,
+    RiskDetail has_any ("unknownFutureValue", "adminConfirmedSigninCompromised"), 85,
+    40
+)
+| extend RiskModifierScore = iff(IsOutsideBusinessHours, 10, 0)
+    + iff(isnotempty(FailedCount) and FailedCount >= 3, 15, 0)
+    + iff(RiskEvents > 1, 20, 0)
+    + iff(IsNewDevice == "false", 5, 0)
+    + iff(AuthMethod != "passwordlessPhone", 5, 0)
+| extend TotalRiskScore = min_of(BaseRiskScore + RiskModifierScore, 100)
+| extend Severity = case(
+    TotalRiskScore >= 80, "Critical",
+    TotalRiskScore >= 60, "High",
+    TotalRiskScore >= 40, "Medium",
+    "Low"
+)
+| extend ATTACKTactic = pack_array(
+    "Initial Access (TA0001)",
+    "Privilege Escalation (TA0004)",
+    "Defense Evasion (TA0005)",
+    "Persistence (TA0003)"
+)
+| extend ATTACKTechnique = pack_array(
+    "Valid Accounts (T1078)",
+    "Valid Accounts: Cloud Accounts (T1078.004)",
+    "Valid Accounts: Admin Accounts (T1078.002)",
+    "Account Manipulation (T1098)"
+)
+| project 
+    TimeGenerated,
+    UserDisplayName,
+    UserPrincipalName,
+    Category,
+    OperationName,
+    RiskDetail,
+    RiskLevelDuringSignIn,
+    RiskState,
+    BaseRiskScore,
+    RiskModifierScore,
+    TotalRiskScore,
+    Severity,
+    IsOutsideBusinessHours,
+    FailedCount,
+    LastFailedTime,
+    RiskEvents,
+    AuthMethod,
+    IPAddress,
+    City,
+    Country,
+    DeviceBrowser,
+    DeviceOS,
+    IsNewDevice,
+    CorrelationId,
+    ATTACKTactic,
+    ATTACKTechnique
+| order by TotalRiskScore desc, TimeGenerated desc
