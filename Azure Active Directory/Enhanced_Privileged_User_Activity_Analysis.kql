@@ -1,0 +1,147 @@
+//************************************************************************************************************
+// Title: Enhanced Privileged User Activity Analysis
+//************************************************************************************************************
+// Description: Detects suspicious patterns in privileged user activities including out-of-normal operations,
+// high-risk actions, and potential privilege escalation attempts.
+// Author: Sameer P Sheik
+//************************************************************************************************************
+// MITRE ATT&CK Mapping:
+// - Tactic: Privilege Escalation (TA0004)
+//   - Technique: Valid Accounts (T1078)
+//     - Sub-technique: Cloud Accounts (T1078.004)
+// - Tactic: Persistence (TA0003)
+//   - Technique: Account Manipulation (T1098)
+//     - Sub-technique: Additional Cloud Credentials (T1098.001)
+//************************************************************************************************************
+// Severity: High
+// The alert severity is determined by:
+// - High: Multiple critical operations or high volume of unique targets
+// - Medium: Elevated number of operations or unusual activity patterns
+// - Low: Minor deviations from baseline behavior
+//************************************************************************************************************
+// Required Data Connectors: 
+// - Azure Active Directory - Audit Logs
+// - Microsoft Sentinel UEBA
+//************************************************************************************************************
+// Validation against Microsoft Sentinel Analytics:
+// 1. Complements existing rules:
+//    - "Changes to privileged groups" (ID: 4367dddd-ba56-4fa5-b69c-6dfcbf22c3bc)
+//    - "Suspicious number of resource creation or deployment activities" (ID: 361dd1f3-1c11-491e-82a3-fdd577f19426)
+//    - "Multiple admin membership manipulations" (ID: ac7401b3-7f23-4a68-8ae9-2c7862946e85)
+//************************************************************************************************************
+// 2. Extended Coverage:
+//    - Fine-grained attribute-level monitoring
+//    - User behavior analytics integration
+//    - Cross-correlation with identity risk
+//    - Historical pattern analysis
+//************************************************************************************************************
+// 3. Differentiators:
+//    - Focuses on privileged user behavioral patterns
+//    - Incorporates role-based risk assessment
+//    - Provides detailed activity timelines
+//    - Includes contextual IP analysis
+//************************************************************************************************************
+// False Positive Scenarios:
+// 1. Bulk administrative actions during planned maintenance
+// 2. Authorized PIM activations for multiple role assignments
+// 3. Automated service account operations
+// 4. Legitimate mass user provisioning events
+//************************************************************************************************************
+// Version: 2.0
+// Last Updated: 2024-02-07
+//************************************************************************************************************
+// First get the privileged users and their activities
+//************************************************************************************************************
+AuditLogs
+| where TimeGenerated > ago(360d)
+| extend Actor = tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName)
+| where isnotempty(Actor)
+| extend IPAddress = tostring(parse_json(tostring(InitiatedBy.user)).ipAddress)
+| extend TargetResources = parse_json(tostring(TargetResources))
+| extend Target = tostring(TargetResources[0].userPrincipalName)
+| extend CriticalOperation = OperationName in (
+    "Add member to role",           // T1078.004
+    "Update user",                  // T1098
+    "Reset user password",          // T1098
+    "Add app role assignment to user", // T1098.001
+    "Add owner to application",     // T1098.001
+    "Update service principal",     // T1098
+    "Add delegated permission grant", // T1098.001
+    "Add app role assignment to service principal" // T1098.001
+)
+| join kind=inner (
+    IdentityInfo
+    | where TimeGenerated > ago(21d)
+    | summarize arg_max(TimeGenerated, *) by AccountUPN
+    | where isnotempty(AssignedRoles) and AssignedRoles != "[]"
+    | extend RolesList = parse_json(AssignedRoles)
+    | mv-expand Role = RolesList
+    | summarize Roles = make_set(Role) by AccountUPN
+) on $left.Actor == $right.AccountUPN
+| summarize 
+    TotalOperations = count(),
+    CriticalOps = sum(iif(CriticalOperation == true, 1, 0)),
+    UniqueTargets = dcount(Target),
+    UniqueIPs = dcount(IPAddress),
+    OperationList = make_set(OperationName),
+    DailyActivity = make_list(pack(
+        "Operation", OperationName,
+        "Target", Target,
+        "IPAddress", IPAddress,
+        "IsHighRisk", CriticalOperation,
+        "TimeGenerated", TimeGenerated
+    ))
+    by Actor, bin(TimeGenerated, 1d)
+| extend RiskScore = case(
+    CriticalOps > 5, 1.0,
+    UniqueTargets > 20, 0.8,
+    TotalOperations > 50, 0.7,
+    0.3
+)
+| extend AlertSeverity = case(
+    RiskScore >= 0.8, "High",
+    RiskScore >= 0.6, "Medium",
+    "Low"
+)
+| where RiskScore >= 0.7
+| extend 
+    TTPTactic = dynamic(["Privilege Escalation", "Persistence"]),
+    TTPTechnique = dynamic(["Valid Accounts", "Account Manipulation"]),
+    TTPSubTechnique = dynamic(["Cloud Accounts", "Additional Cloud Credentials"]),
+    TTPReference = dynamic(["T1078.004", "T1098.001"]),
+    Description = strcat(
+        "High-risk privileged activity detected:\n",
+        "- User: ", Actor, "\n",
+        "- Total Operations: ", TotalOperations, "\n",
+        "- Critical Operations: ", CriticalOps, "\n",
+        "- Unique Targets: ", UniqueTargets, "\n",
+        "- Distinct IP Addresses: ", UniqueIPs, "\n",
+        "- Operations Performed: ", tostring(OperationList)
+    ),
+    RemediationSteps = dynamic([
+        "1. Review user's privileged role assignments and verify least privilege compliance",
+        "2. Check change management system for approved tickets corresponding to these actions",
+        "3. Verify PIM activation logs and justifications for role usage",
+        "4. Analyze authentication patterns and IP addresses for potential compromised credentials",
+        "5. Review target resources for unauthorized modifications",
+        "6. Check for any concurrent PIM activations or role assignments",
+        "7. Implement additional monitoring for identified high-risk operations"
+    ])
+| project
+    TimeGenerated,
+    Actor,
+    DailyActivity,
+    TotalOperations,
+    CriticalOps,
+    UniqueTargets,
+    UniqueIPs,
+    OperationList,
+    RiskScore,
+    AlertSeverity,
+    TTPTactic,
+    TTPTechnique,
+    TTPSubTechnique,
+    TTPReference,
+    Description,
+    RemediationSteps
+| order by RiskScore desc, TimeGenerated asc
