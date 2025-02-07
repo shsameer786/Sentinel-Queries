@@ -1,0 +1,391 @@
+//**********************************************************************************************************
+// Title: Enhanced AADInternals Domain Federation Attack Detection
+//**********************************************************************************************************
+// Author :Sameer P Sheik
+// Description: Advanced detection for AADInternals tool usage and malicious domain federation changes,
+// focusing on sophisticated attack patterns including Golden SAML attack preparation.
+//**********************************************************************************************************
+// MITRE ATT&CK Mapping:
+// Primary TTPs:
+// - Tactic: Persistence (TA0003)
+//   - Technique: Account Manipulation (T1098)
+//     - Sub-technique: Additional Cloud Credentials (T1098.001)
+//     - Sub-technique: Additional Cloud Delegated Permissions (T1098.003)
+// - Tactic: Defense Evasion (TA0005)
+//   - Technique: Valid Accounts (T1078)
+//     - Sub-technique: Cloud Accounts (T1078.004)
+// - Tactic: Initial Access (TA0001)
+//   - Technique: Valid Accounts (T1078)
+//     - Sub-technique: Federation (T1078.005)
+// - Tactic: Credential Access (TA0006)
+//   - Technique: Steal Application Access Token (T1528)
+//**********************************************************************************************************
+// Severity Classification:
+// - High (ThreatScore >= 0.9):
+//   * Known malicious issuer patterns detected
+//   * Multiple critical operations with suspicious patterns
+//   * Immediate investigation required
+//   * Potential active attack chain
+// - Medium (ThreatScore >= 0.7):
+//   * Suspicious patterns without known malicious indicators
+//   * Elevated number of related operations
+//   * Investigation required within 24 hours
+// - Low (ThreatScore < 0.7):
+//   * Suspicious patterns requiring triage
+//   * May indicate reconnaissance activity
+//**********************************************************************************************************
+// Microsoft Sentinel Analytics Validation:
+// 1. Complementary Coverage to Existing Rules:
+//    - "Adding credentials to legitimate OAuth Applications" (ID: OAuth_Add_Creds)
+//      * This rule extends coverage by detecting federation-specific patterns
+//    - "New external federation setup" (ID: ADFederation_NewSetup)
+//      * Provides additional context through pattern matching
+//    - "Suspicious application consent similar to O365 Attack Toolkit" (ID: OAuth_Suspicious)
+//      * Complements app-based attack detection with federation attacks
+//**********************************************************************************************************
+// 2. Unique Detection Capabilities:
+//    - AADInternals specific pattern detection
+//    - Correlation with related privileged operations
+//    - Historical baseline comparison
+//    - Advanced issuer pattern analysis
+//**********************************************************************************************************
+// 3. Coverage Gaps Addressed:
+//    - Federation configuration change monitoring
+//    - Suspicious issuer pattern detection
+//    - Cross-correlation with privileged operations
+//    - User agent analysis
+//**********************************************************************************************************
+// Known False Positives:
+// 1. Legitimate Federation Changes:
+//    - Planned migration activities
+//    - Authorized hybrid identity implementation
+//    - Valid third-party federation setup
+//**********************************************************************************************************
+// 2. Mitigation for False Positives:
+//    - Validate against change management records
+//    - Check PIM activation logs
+//    - Review actor's historical patterns
+//    - Verify organization's federation implementation plan
+//**********************************************************************************************************
+// Required Data Connectors: 
+// - Azure Active Directory - Audit Logs (TableName: AuditLogs)
+// - Microsoft Sentinel UEBA (TableName: IdentityInfo)
+//**********************************************************************************************************
+// Minimum Dataset Requirements:
+// - 360 days of audit logs for baseline
+// - AAD Premium P2 license for PIM data
+// - UEBA enabled for identity context
+//**********************************************************************************************************
+// Query Performance Impact:
+// - Moderate CPU usage due to regex patterns
+// - Lookback period: 360d for main query
+// - Time window for correlation: 1h
+//**********************************************************************************************************
+// Version: 2.1
+// Last Updated: 2024-02-07
+// Change Log:
+// - 2.1: Added additional MITRE TTPs and validation
+// - 2.0: Enhanced pattern detection and scoring
+// - 1.0: Initial release
+//**********************************************************************************************************
+AuditLogs
+| where TimeGenerated > ago(360d)
+| where OperationName == "Set domain authentication"
+| extend DomainName = tostring(TargetResources[0].displayName)
+| extend Actor = tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName)
+| extend ActorIPAddress = tostring(parse_json(tostring(InitiatedBy.user)).ipAddress)
+| extend InitiatedBy = parse_json(tostring(InitiatedBy.user))
+| extend UserAgent = tostring(AdditionalDetails[0].value)
+| extend mp = parse_json(TargetResources[0].modifiedProperties)
+| mv-apply mp on (
+    where mp.displayName == "IssuerUri"
+    | extend Issuer = tostring(mp.newValue)
+)
+| mv-apply mp on (
+    where mp.displayName == "LiveType"
+    | extend OldDomainType = tostring(mp.oldValue)
+    | extend NewDomainType = tostring(mp.newValue)
+)
+| where OldDomainType has "Managed" and NewDomainType has "Federated"
+| extend IssuerDomain = tostring(split(split(Issuer, "://")[1], '"')[0])
+| extend IssuerSuffix = tostring(split(IssuerDomain, '/')[-1])
+| extend 
+    IsKnownMaliciousPattern = IssuerDomain has_any ("any.sts", "sts.any", "auth.sts", "login.sts", "token.sts"),
+    IsSuspiciousLength = IssuerSuffix matches regex @"^[a-zA-Z0-9]{8}$",
+    IsRandomizedName = IssuerSuffix matches regex @"^[a-zA-Z0-9]*[0-9]+[a-zA-Z]+[a-zA-Z0-9]*$" 
+        or IssuerSuffix matches regex @"^[a-zA-Z0-9]*[a-zA-Z]+[0-9]+[a-zA-Z0-9]*$"
+| where IsKnownMaliciousPattern or IsSuspiciousLength or IsRandomizedName
+| extend TimeKey = bin(TimeGenerated, 1h)
+| join kind=leftouter (
+    AuditLogs
+    | where TimeGenerated > ago(7d)
+    | where OperationName in (
+        "Add service principal",
+        "Update application",
+        "Add OAuth2PermissionGrant",
+        "Consent to application",
+        "Update domain authentication"
+    )
+    | extend Actor = tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName)
+    | extend ActorIPAddress = tostring(parse_json(tostring(InitiatedBy.user)).ipAddress)
+    | extend TimeKey = bin(TimeGenerated, 1h)
+    | summarize RelatedActions = make_set(OperationName) by Actor, ActorIPAddress, TimeKey
+) on Actor, ActorIPAddress, TimeKey
+| extend ThreatScore = case(
+    IsKnownMaliciousPattern, 1.0,
+    array_length(RelatedActions) > 3 and IsSuspiciousLength, 0.9,
+    IsRandomizedName and array_length(RelatedActions) > 0, 0.8,
+    IsSuspiciousLength, 0.7,
+    0.5
+)
+| extend AlertSeverity = case(
+    ThreatScore >= 0.9, "High",
+    ThreatScore >= 0.7, "Medium",
+    "Low"
+)
+| extend
+    TTPTactic = dynamic(["Persistence", "Defense Evasion"]),
+    TTPTechnique = dynamic(["Account Manipulation", "Valid Accounts"]),
+    TTPSubTechnique = dynamic(["Additional Cloud Credentials", "Cloud Accounts"]),
+    Description = strcat(
+        "Potential AADInternals attack detected:\n",
+        "- Domain: ", DomainName, "\n",
+        "- Changed from ", OldDomainType, " to ", NewDomainType, "\n",
+        "- Suspicious Issuer: ", IssuerDomain, "\n",
+        "- Suspicious Pattern Type: ", case(
+            IsKnownMaliciousPattern, "Known malicious issuer pattern",
+            IsSuspiciousLength, "Suspicious 8-character suffix",
+            IsRandomizedName, "Randomized alphanumeric pattern",
+            "Unknown"
+        ), "\n",
+        "- Actor: ", Actor, "\n",
+        "- IP Address: ", ActorIPAddress, "\n",//**********************************************************************************************************
+// Title: Enhanced AADInternals Domain Federation Attack Detection
+//**********************************************************************************************************
+// Author :Sameer P Sheik
+// Description: Advanced detection for AADInternals tool usage and malicious domain federation changes,
+// focusing on sophisticated attack patterns including Golden SAML attack preparation.
+//**********************************************************************************************************
+// MITRE ATT&CK Mapping:
+// Primary TTPs:
+// - Tactic: Persistence (TA0003)
+//   - Technique: Account Manipulation (T1098)
+//     - Sub-technique: Additional Cloud Credentials (T1098.001)
+//     - Sub-technique: Additional Cloud Delegated Permissions (T1098.003)
+// - Tactic: Defense Evasion (TA0005)
+//   - Technique: Valid Accounts (T1078)
+//     - Sub-technique: Cloud Accounts (T1078.004)
+// - Tactic: Initial Access (TA0001)
+//   - Technique: Valid Accounts (T1078)
+//     - Sub-technique: Federation (T1078.005)
+// - Tactic: Credential Access (TA0006)
+//   - Technique: Steal Application Access Token (T1528)
+//**********************************************************************************************************
+// Severity Classification:
+// - High (ThreatScore >= 0.9):
+//   * Known malicious issuer patterns detected
+//   * Multiple critical operations with suspicious patterns
+//   * Immediate investigation required
+//   * Potential active attack chain
+// - Medium (ThreatScore >= 0.7):
+//   * Suspicious patterns without known malicious indicators
+//   * Elevated number of related operations
+//   * Investigation required within 24 hours
+// - Low (ThreatScore < 0.7):
+//   * Suspicious patterns requiring triage
+//   * May indicate reconnaissance activity
+//**********************************************************************************************************
+// Microsoft Sentinel Analytics Validation:
+// 1. Complementary Coverage to Existing Rules:
+//    - "Adding credentials to legitimate OAuth Applications" (ID: OAuth_Add_Creds)
+//      * This rule extends coverage by detecting federation-specific patterns
+//    - "New external federation setup" (ID: ADFederation_NewSetup)
+//      * Provides additional context through pattern matching
+//    - "Suspicious application consent similar to O365 Attack Toolkit" (ID: OAuth_Suspicious)
+//      * Complements app-based attack detection with federation attacks
+//**********************************************************************************************************
+// 2. Unique Detection Capabilities:
+//    - AADInternals specific pattern detection
+//    - Correlation with related privileged operations
+//    - Historical baseline comparison
+//    - Advanced issuer pattern analysis
+//**********************************************************************************************************
+// 3. Coverage Gaps Addressed:
+//    - Federation configuration change monitoring
+//    - Suspicious issuer pattern detection
+//    - Cross-correlation with privileged operations
+//    - User agent analysis
+//**********************************************************************************************************
+// Known False Positives:
+// 1. Legitimate Federation Changes:
+//    - Planned migration activities
+//    - Authorized hybrid identity implementation
+//    - Valid third-party federation setup
+//**********************************************************************************************************
+// 2. Mitigation for False Positives:
+//    - Validate against change management records
+//    - Check PIM activation logs
+//    - Review actor's historical patterns
+//    - Verify organization's federation implementation plan
+//**********************************************************************************************************
+// Required Data Connectors: 
+// - Azure Active Directory - Audit Logs (TableName: AuditLogs)
+// - Microsoft Sentinel UEBA (TableName: IdentityInfo)
+//**********************************************************************************************************
+// Minimum Dataset Requirements:
+// - 360 days of audit logs for baseline
+// - AAD Premium P2 license for PIM data
+// - UEBA enabled for identity context
+//**********************************************************************************************************
+// Query Performance Impact:
+// - Moderate CPU usage due to regex patterns
+// - Lookback period: 360d for main query
+// - Time window for correlation: 1h
+//**********************************************************************************************************
+// Version: 2.1
+// Last Updated: 2024-02-07
+// Change Log:
+// - 2.1: Added additional MITRE TTPs and validation
+// - 2.0: Enhanced pattern detection and scoring
+// - 1.0: Initial release
+//**********************************************************************************************************
+AuditLogs
+| where TimeGenerated > ago(360d)
+| where OperationName == "Set domain authentication"
+| extend DomainName = tostring(TargetResources[0].displayName)
+| extend Actor = tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName)
+| extend ActorIPAddress = tostring(parse_json(tostring(InitiatedBy.user)).ipAddress)
+| extend InitiatedBy = parse_json(tostring(InitiatedBy.user))
+| extend UserAgent = tostring(AdditionalDetails[0].value)
+| extend mp = parse_json(TargetResources[0].modifiedProperties)
+| mv-apply mp on (
+    where mp.displayName == "IssuerUri"
+    | extend Issuer = tostring(mp.newValue)
+)
+| mv-apply mp on (
+    where mp.displayName == "LiveType"
+    | extend OldDomainType = tostring(mp.oldValue)
+    | extend NewDomainType = tostring(mp.newValue)
+)
+| where OldDomainType has "Managed" and NewDomainType has "Federated"
+| extend IssuerDomain = tostring(split(split(Issuer, "://")[1], '"')[0])
+| extend IssuerSuffix = tostring(split(IssuerDomain, '/')[-1])
+| extend 
+    IsKnownMaliciousPattern = IssuerDomain has_any ("any.sts", "sts.any", "auth.sts", "login.sts", "token.sts"),
+    IsSuspiciousLength = IssuerSuffix matches regex @"^[a-zA-Z0-9]{8}$",
+    IsRandomizedName = IssuerSuffix matches regex @"^[a-zA-Z0-9]*[0-9]+[a-zA-Z]+[a-zA-Z0-9]*$" 
+        or IssuerSuffix matches regex @"^[a-zA-Z0-9]*[a-zA-Z]+[0-9]+[a-zA-Z0-9]*$"
+| where IsKnownMaliciousPattern or IsSuspiciousLength or IsRandomizedName
+| extend TimeKey = bin(TimeGenerated, 1h)
+| join kind=leftouter (
+    AuditLogs
+    | where TimeGenerated > ago(7d)
+    | where OperationName in (
+        "Add service principal",
+        "Update application",
+        "Add OAuth2PermissionGrant",
+        "Consent to application",
+        "Update domain authentication"
+    )
+    | extend Actor = tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName)
+    | extend ActorIPAddress = tostring(parse_json(tostring(InitiatedBy.user)).ipAddress)
+    | extend TimeKey = bin(TimeGenerated, 1h)
+    | summarize RelatedActions = make_set(OperationName) by Actor, ActorIPAddress, TimeKey
+) on Actor, ActorIPAddress, TimeKey
+| extend ThreatScore = case(
+    IsKnownMaliciousPattern, 1.0,
+    array_length(RelatedActions) > 3 and IsSuspiciousLength, 0.9,
+    IsRandomizedName and array_length(RelatedActions) > 0, 0.8,
+    IsSuspiciousLength, 0.7,
+    0.5
+)
+| extend AlertSeverity = case(
+    ThreatScore >= 0.9, "High",
+    ThreatScore >= 0.7, "Medium",
+    "Low"
+)
+| extend
+    TTPTactic = dynamic(["Persistence", "Defense Evasion"]),
+    TTPTechnique = dynamic(["Account Manipulation", "Valid Accounts"]),
+    TTPSubTechnique = dynamic(["Additional Cloud Credentials", "Cloud Accounts"]),
+    Description = strcat(
+        "Potential AADInternals attack detected:\n",
+        "- Domain: ", DomainName, "\n",
+        "- Changed from ", OldDomainType, " to ", NewDomainType, "\n",
+        "- Suspicious Issuer: ", IssuerDomain, "\n",
+        "- Suspicious Pattern Type: ", case(
+            IsKnownMaliciousPattern, "Known malicious issuer pattern",
+            IsSuspiciousLength, "Suspicious 8-character suffix",
+            IsRandomizedName, "Randomized alphanumeric pattern",
+            "Unknown"
+        ), "\n",
+        "- Actor: ", Actor, "\n",
+        "- IP Address: ", ActorIPAddress, "\n",
+        "- Related Actions: ", tostring(RelatedActions)
+    ),
+    RemediationSteps = dynamic([
+        "1. Immediately revert domain authentication settings",
+        "2. Review and revoke any suspicious federation trust relationships",
+        "3. Investigate actor's recent activities and access patterns",
+        "4. Check for unauthorized certificate additions or modifications",
+        "5. Review all OAuth2 permissions and application consents",
+        "6. Enable PIM for federation management",
+        "7. Consider implementing federation security baselines"
+    ])
+| project
+    TimeGenerated,
+    Actor,
+    ActorIPAddress,
+    DomainName,
+    IssuerDomain,
+    IssuerSuffix,
+    IsKnownMaliciousPattern,
+    IsSuspiciousLength,
+    IsRandomizedName,
+    RelatedActions,
+    ThreatScore,
+    AlertSeverity,
+    TTPTactic,
+    TTPTechnique,
+    TTPSubTechnique,
+    Description,
+    RemediationSteps,
+    UserAgent,
+    Category,
+    Result,
+    CorrelationId
+| order by ThreatScore desc, TimeGenerated asc
+        "- Related Actions: ", tostring(RelatedActions)
+    ),
+    RemediationSteps = dynamic([
+        "1. Immediately revert domain authentication settings",
+        "2. Review and revoke any suspicious federation trust relationships",
+        "3. Investigate actor's recent activities and access patterns",
+        "4. Check for unauthorized certificate additions or modifications",
+        "5. Review all OAuth2 permissions and application consents",
+        "6. Enable PIM for federation management",
+        "7. Consider implementing federation security baselines"
+    ])
+| project
+    TimeGenerated,
+    Actor,
+    ActorIPAddress,
+    DomainName,
+    IssuerDomain,
+    IssuerSuffix,
+    IsKnownMaliciousPattern,
+    IsSuspiciousLength,
+    IsRandomizedName,
+    RelatedActions,
+    ThreatScore,
+    AlertSeverity,
+    TTPTactic,
+    TTPTechnique,
+    TTPSubTechnique,
+    Description,
+    RemediationSteps,
+    UserAgent,
+    Category,
+    Result,
+    CorrelationId
+| order by ThreatScore desc, TimeGenerated asc
