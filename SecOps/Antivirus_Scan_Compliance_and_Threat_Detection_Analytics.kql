@@ -1,0 +1,102 @@
+//*******************************************************************************************************************************
+// Title: Antivirus Scan Compliance and Threat Detection Analytics
+//*******************************************************************************************************************************
+// Description: Monitors antivirus scan compliance, tracks scan patterns, and detects potential threats across devices
+// Severity: Medium
+// Author: Samee P Sheik
+//*******************************************************************************************************************************
+// MITRE ATT&CK:
+// - Defense Evasion [T1562.001] - Impair Defenses: Disable or Modify Tools
+// - Discovery [T1518.001] - Software Discovery: Security Software Discovery
+//*******************************************************************************************************************************
+// Validates against:
+// - Microsoft Defender for Endpoint built-in alerts for antivirus tampering
+// - Custom analytics for scan frequency monitoring
+// - Related scheduled task and service status monitoring rules
+//*******************************************************************************************************************************
+// Additional coverage gaps addressed:
+// - Aggregated view of scan compliance across environment 
+// - Historical scan pattern analysis
+// - Threat detection correlation with scan findings
+// - User/system-initiated scan tracking
+//*******************************************************************************************************************************
+DeviceEvents
+| where Timestamp > ago(360d)
+| where ActionType has "AntivirusScanCompleted"
+// Parse additional fields
+| extend AdditionalFields = todynamic(AdditionalFields)
+| extend 
+   ScanTypeIndex = tostring(AdditionalFields.ScanTypeIndex),
+   StartedBy = AdditionalFields.User,
+   ScanStartTime = todatetime(AdditionalFields.ScanStartTime),
+   ThreatCount = iif(isempty(AdditionalFields.ThreatCount), 0, toint(AdditionalFields.ThreatCount)),
+   ScanId = tostring(AdditionalFields.ScanId)
+// Map scan types directly
+| extend ScanTypeName = case(
+   ScanTypeIndex == "Quick", "Quick Scan",
+   ScanTypeIndex == "Full", "Full Scan", 
+   ScanTypeIndex == "Custom", "Custom Scan",
+   ScanTypeIndex == "System", "System Scan",
+   ScanTypeIndex == "RealTime", "Real-time Protection Scan",
+   ScanTypeIndex == "Other", "Other",
+   "Unknown"
+)
+// Calculate scan duration and categorize it
+| extend
+   ScanDuration = datetime_diff('second', Timestamp, ScanStartTime)
+| extend
+   ScanDurationCategory = case(
+       ScanDuration < 300, "Quick (<5 min)",
+       ScanDuration < 1800, "Medium (5-30 min)", 
+       ScanDuration < 3600, "Long (30-60 min)",
+       "Very Long (>60 min)"
+   )
+// Error handling for missing or invalid data
+| extend 
+   StartedBy = iif(isempty(StartedBy), "Unknown", StartedBy)
+// Add insights and statistics
+| summarize 
+   LastScan = max(Timestamp),
+   TotalScans = count(),
+   AvgDuration = avg(ScanDuration),
+   MaxDuration = max(ScanDuration),
+   TotalThreats = sum(ThreatCount),
+   ScanTypes = make_set(ScanTypeName),
+   UniqueInitiators = dcount(StartedBy)
+   by DeviceName
+| extend 
+   DaysFromLastScan = datetime_diff('day', now(), LastScan),
+   AvgDurationMinutes = round(AvgDuration / 60, 2),
+   MaxDurationMinutes = round(MaxDuration / 60, 2)
+// Add compliance status and severity
+| extend ComplianceStatus = case(
+   DaysFromLastScan > 7, "Non-Compliant",
+   TotalScans < 2, "Warning",
+   "Compliant"
+)
+| extend Severity = case(
+   ComplianceStatus == "Non-Compliant", "High",
+   ComplianceStatus == "Warning", "Medium", 
+   "Low"
+)
+// Final projection with all relevant fields
+| project
+   DeviceName,
+   LastScan,
+   DaysFromLastScan,
+   TotalScans,
+   AvgDurationMinutes,
+   MaxDurationMinutes,
+   TotalThreats,
+   ScanTypes,
+   UniqueInitiators,
+   ComplianceStatus,
+   Severity
+| sort by 
+   ComplianceStatus asc,
+   DaysFromLastScan desc
+
+// Alert generation criteria:
+// - High severity: No scans in 7+ days
+// - Medium severity: Less than 2 scans in timeframe
+// - Any severity with TotalThreats > 0
