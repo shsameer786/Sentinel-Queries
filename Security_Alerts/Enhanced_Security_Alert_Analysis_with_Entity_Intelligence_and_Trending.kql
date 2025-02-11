@@ -1,0 +1,149 @@
+//////////////////////////////////////////////////////////////////////////////////////////////////
+// Title: Enhanced Security Alert Analysis with Entity Intelligence and Trending
+// Purpose: Analyze security alerts with severity distribution, MITRE mapping, and baseline comparison
+// Author: Sameer P Sheik
+//------------------------------------------------------------------------------------------------
+// MITRE ATT&CK Mapping:
+// - Tactic: Defense Evasion (TA0005)
+//   - Technique: T1562 - Impair Defenses
+//   - Sub-technique: T1562.001 - Disable or Modify Tools
+// - Tactic: Discovery (TA0007)
+//   - Technique: T1046 - Network Service Discovery
+//------------------------------------------------------------------------------------------------
+// Severity Mapping:
+// - High: Critical security impacts, immediate response required
+//   * Disabled security tools
+//   * Known malicious activity
+//   * Potential data exfiltration
+// - Medium: Suspicious activities requiring investigation
+//   * Unusual system behavior
+//   * Policy violations
+//   * Reconnaissance activities
+// - Low: Informational alerts for awareness
+//   * Configuration changes
+//   * New service installations
+//   * Network scanning
+//------------------------------------------------------------------------------------------------
+// Rule Validation:
+// 1. Complementarity with OOB Analytics:
+//    - Microsoft Defender for Endpoint: 
+//      * Complements behavioral analytics
+//      * Extends entity correlation capabilities
+//    - Microsoft Sentinel Analytics:
+//      * Adds trending analysis not present in default rules
+//      * Enhances baseline deviation detection
+//------------------------------------------------------------------------------------------------
+// 2. Coverage Analysis:
+//    - Fills gaps in:
+//      * Long-term trend analysis
+//      * Entity relationship mapping
+//      * Severity distribution patterns
+//      * Alert volume baseline monitoring
+//------------------------------------------------------------------------------------------------
+// 3. Potential False Positives:
+//    - Maintenance windows causing alert spikes
+//    - Security tool updates triggering multiple alerts
+//    - Legitimate scanning activities
+//------------------------------------------------------------------------------------------------
+// 4. Response Guidance:
+//    - High Severity (>2 std dev): Immediate investigation
+//    - Medium Severity with entity correlation: Prioritize investigation
+//    - Baseline deviations >50%: Review security posture
+//    - Multiple affected entities: Potential lateral movement
+//////////////////////////////////////////////////////////////////////////////////////////////////
+//------------------------------------------------------------------------------------------------
+let timeRange = 180d;
+let binSize = 7d;
+// Get baseline metrics with better error handling
+let BaselineMetrics = toscalar(
+    SecurityAlert
+    | where TimeGenerated between (ago(2*timeRange) .. ago(timeRange))
+    | summarize
+        BaselineAlertCount = count(),
+        BaselineUniqueEntities = dcountif(CompromisedEntity, isnotempty(CompromisedEntity))
+    | extend 
+        BaselineAlertsPerDay = iff(timeRange/1d > 0, todouble(BaselineAlertCount) / todouble(timeRange/1d), 0.0),
+        BaselineEntitiesPerDay = iff(timeRange/1d > 0, todouble(BaselineUniqueEntities) / todouble(timeRange/1d), 0.0)
+    | project pack('metrics', pack_all())
+);
+// Main query with enhanced metrics
+SecurityAlert
+| where TimeGenerated > ago(timeRange)
+| where ProductName !in ("ASI Scheduled Alerts", "Azure Sentinel")
+| where Status == "New"
+// Severity enrichment with justification
+| extend 
+    SeverityRank = case(
+        AlertSeverity == "High", 3,      // Critical impact requiring immediate response
+        AlertSeverity == "Medium", 2,    // Suspicious activity needing investigation
+        AlertSeverity == "Low", 1,       // Informational alerts for awareness
+        0)                               // Unknown/Undefined severity
+| summarize 
+    TotalAlerts = count(),
+    UniqueEntityAlerts = dcountif(CompromisedEntity, isnotempty(CompromisedEntity)),
+    HighSeverityAlerts = countif(AlertSeverity == "High"),
+    MediumSeverityAlerts = countif(AlertSeverity == "Medium"),
+    LowSeverityAlerts = countif(AlertSeverity == "Low"),
+    UniqueAlertTypes = dcount(AlertType),
+    TopAlertTypes = make_set(AlertType, 5),
+    TopAffectedEntities = make_set_if(CompromisedEntity, isnotempty(CompromisedEntity), 3),
+    AverageSeverity = round(avg(SeverityRank), 2),
+    UniqueProducts = dcount(ProductName),
+    TopProducts = make_set(ProductName, 3)
+    by bin(TimeGenerated, binSize)
+| sort by TimeGenerated asc
+// Calculate trend metrics
+| extend
+    WeeklyAlertRate = round(TotalAlerts / todouble(binSize/1d), 2),
+    AlertGrowth = iff(prev(TotalAlerts) > 0, 
+        toreal(round((TotalAlerts - prev(TotalAlerts)) / toreal(prev(TotalAlerts)) * 100, 1)), 
+        0.0),
+    EntityAlertGrowth = iff(prev(UniqueEntityAlerts) > 0,
+        toreal(round((UniqueEntityAlerts - prev(UniqueEntityAlerts)) / toreal(prev(UniqueEntityAlerts)) * 100, 1)),
+        0.0)
+// Add baseline comparison
+| extend 
+    BaselineAlertsPerDay = todouble(todynamic(BaselineMetrics).metrics.BaselineAlertsPerDay),
+    BaselineEntitiesPerDay = todouble(todynamic(BaselineMetrics).metrics.BaselineEntitiesPerDay)
+| extend
+    AlertsBaselineDeviation = iff(BaselineAlertsPerDay > 0,
+        toreal(round((WeeklyAlertRate - BaselineAlertsPerDay) / BaselineAlertsPerDay * 100, 1)),
+        0.0),
+    SeverityBreakdown = pack(
+        'High', HighSeverityAlerts,
+        'Medium', MediumSeverityAlerts,
+        'Low', LowSeverityAlerts
+    )
+// Project final output
+| project
+    TimeGenerated,
+    WeeklyAlertRate,
+    TotalAlerts,
+    UniqueEntityAlerts,
+    HighSeverityAlerts,
+    MediumSeverityAlerts,
+    LowSeverityAlerts,
+    SeverityBreakdown,
+    AlertGrowth,
+    AlertsBaselineDeviation,
+    AverageSeverity,
+    TopAlertTypes,
+    TopAffectedEntities,
+    TopProducts
+| render timechart with (
+    title="Security Alert Analysis - Weekly Trends",
+    xtitle="Time",
+    ytitle="Alert Count"
+)
+
+// Usage Notes:
+// 1. Adjust timeRange and binSize based on environment size and alert volume
+// 2. Consider adding additional filters for specific product types or alert categories
+// 3. Monitor false positive rates and adjust severity mappings accordingly
+// 4. Regular validation against MITRE TTPs for coverage gaps
+// 5. Periodic review of baseline metrics for accuracy
+
+// Performance Considerations:
+// 1. Large timeRange values may impact query performance
+// 2. Consider materialized views for baseline calculations in large environments
+// 3. Optimize bin size based on alert volume and analysis needs
