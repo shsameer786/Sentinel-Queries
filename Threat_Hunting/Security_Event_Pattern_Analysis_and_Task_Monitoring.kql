@@ -1,0 +1,115 @@
+//==============================================================================
+// Security Event Pattern Analysis and Task Monitoring.
+// Author: Sameer P Sheik
+// Version: 1.0
+//==============================================================================
+// Description: 
+// Advanced detection for suspicious patterns in Windows Security Events, focusing on 
+// authentication, task scheduling, and firewall modifications with detailed task tracking.
+//------------------------------------------------------------------------------
+// Severity: Medium
+//------------------------------------------------------------------------------
+// MITRE ATT&CK Tactics & Techniques:
+// - T1053 - Scheduled Task/Job (Task Scheduling operations)
+// - T1078 - Valid Accounts (Authentication events monitoring)
+// - T1562.004 - Disable/Modify Firewall (Firewall rule modifications)
+// - T1098 - Account Manipulation (Account privilege changes)
+// - T1543.003 - Windows Service (Service installations)
+//------------------------------------------------------------------------------
+// False Positive Scenarios:
+// - Routine system maintenance during approved change windows
+// - Automated system updates modifying tasks
+// - Legitimate mass firewall rule updates during policy changes
+//------------------------------------------------------------------------------
+// Validation against OOB Analytics:
+// - Complements "Suspicious number of failed logons" by adding task correlation
+// - Extends "Windows firewall rule modified" with pattern detection
+// - Adds to "Scheduled task created" with detailed task tracking
+// - Enhanced coverage over "Account added and removed" with temporal analysis
+//------------------------------------------------------------------------------
+// Alert Trigger Criteria:
+// - High volume of task modifications (>100 in timeframe)
+// - Balanced firewall rule additions/deletions
+// - Authentication attempts outside working hours
+// - Multiple account privilege changes
+//------------------------------------------------------------------------------
+// Response Playbook:
+// 1. Validate task changes against approved change records
+// 2. Review firewall rule modifications for legitimate business need
+// 3. Cross-reference account activities with HR systems
+// 4. Check for corresponding change management tickets
+//==============================================================================
+
+let TaskEvents = 
+    SecurityEvent
+    | where TimeGenerated > ago(360d)
+    | where EventID in (4697, 4698, 4699, 4700, 4701, 4702)
+    | summarize
+        TaskDetails = make_set(Activity),
+        TaskAccounts = make_set(Account),
+        TaskSubjectAccounts = make_set(SubjectAccount)
+        by Computer;
+SecurityEvent
+| where TimeGenerated > ago(360d)
+| extend 
+    Hour = datetime_part("hour", TimeGenerated),
+    DayOfWeek = dayofweek(TimeGenerated),
+    SecurityCategory = case(
+        EventID in (4624, 4625, 4634, 4647), "Authentication",          // T1078
+        EventID in (4946, 4947, 4948, 4949, 4957, 5024, 5033), "Firewall",  // T1562.004
+        EventID in (4697, 4698, 4699, 4700, 4701, 4702), "Task Scheduling", // T1053
+        EventID in (4688, 4696), "Process Creation",                    // T1543.003
+        EventID in (4663, 4662, 4670), "Object Access",
+        EventID in (4608, 4610, 4611, 4614, 4622), "System Security",
+        "Other"
+    )
+| summarize
+    TotalEvents = count(),
+    FailedLogons = countif(EventID == 4625),
+    SuccessLogons = countif(EventID == 4624),
+    FirewallAdds = countif(EventID == 4946),
+    FirewallDeletes = countif(EventID == 4948),
+    FirewallModifies = countif(EventID == 4947),
+    TaskCreations = countif(EventID == 4698),
+    TaskDeletions = countif(EventID == 4699),
+    TaskUpdates = countif(EventID == 4702),
+    UniqueAccounts = dcount(Account),
+    AccountList = make_set(Account),
+    Categories = make_set(SecurityCategory),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    ActivityHours = make_set(Hour)
+    by EventSourceName, Computer
+| extend 
+    FirewallChanges = FirewallAdds + FirewallDeletes + FirewallModifies,
+    TaskChanges = TaskCreations + TaskDeletions + TaskUpdates,
+    TotalLogons = SuccessLogons + FailedLogons
+| lookup TaskEvents on Computer  
+| project
+    Computer,
+    EventSourceName,
+    TotalEvents,
+    TotalLogons,
+    SuccessLogons,
+    FailedLogons,
+    FirewallChanges,
+    TaskChanges,
+    DetailedFirewall = pack(
+        "Added", FirewallAdds,
+        "Deleted", FirewallDeletes,
+        "Modified", FirewallModifies
+    ),
+    DetailedTasks = pack(
+        "Created", TaskCreations,
+        "Deleted", TaskDeletions,
+        "Updated", TaskUpdates
+    ),
+    TaskDetails,
+    TaskAccounts,
+    TaskSubjectAccounts,
+    UniqueAccounts,
+    AccountList,
+    Categories,
+    ActivityHours,
+    TimeSpan = datetime_diff('hour', LastSeen, FirstSeen)
+| order by TotalEvents desc
