@@ -1,5 +1,5 @@
 //************************************************************************************************
-// Title: Advanced SMB Share Discovery and Data Exfiltration Detectionnew 1
+// Title: Advanced SMB Share Discovery and Data Exfiltration Detection
 // Purpose: Detection of file share discovery, sensitive data access, and potential data exfiltration via SMB 
 // Author: Sameer P Sheik
 // Reference: https://www.dionach.com/blog/discovering-sensitive-information-in-file-shares/
