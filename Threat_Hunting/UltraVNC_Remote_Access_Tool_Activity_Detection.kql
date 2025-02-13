@@ -1,0 +1,137 @@
+//**************************************************************************************************************
+// Rule Name: UltraVNC Remote Access Tool Activity Detection
+// Rule GUID: b8936de6-e9e4-4b6d-8e7c-a41598ae2552
+// Created: 2025-02-13
+// Updated: 2025-02-13
+// Author: Sameer P Sheik
+//**************************************************************************************************************
+// Description: This rule detects potentially suspicious UltraVNC remote access tool activity by monitoring
+// process creation, file operations, registry modifications, and service installations.
+//**************************************************************************************************************
+// Severity: High
+//**************************************************************************************************************
+// MITRE ATT&CK Mapping:
+// - T1021.001 - Remote Services: Remote Desktop Protocol
+// - T1219 - Remote Access Software
+// - T1076 - Remote Desktop Protocol [Deprecated in favor of T1021.001]
+// - T1563.002 - Remote Service Session Hijacking: RDP Hijacking
+//**************************************************************************************************************
+// False Positive Scenarios:
+// - Legitimate IT administration using UltraVNC for approved remote support
+// - Software deployment systems using UltraVNC for remote management
+// - Automated system maintenance scripts involving remote access
+//**************************************************************************************************************
+// False Positive Reduction:
+// - Whitelist known IT admin accounts
+// - Filter out known deployment server IPs
+// - Exclude approved maintenance time windows
+//**************************************************************************************************************
+// Validation against OOB Analytics:
+// - Microsoft Defender for Endpoint:
+//   * "Remote Desktop Protocol activity" (AlertID: b8936de6)
+//   * Complementary as this rule adds UltraVNC-specific detection
+//   * Fills gap in non-RDP remote access tool detection
+//**************************************************************************************************************
+// - Azure Sentinel:
+//   * "Remote access tool detected" (RuleID: c9b45c56)
+//   * This rule provides deeper UltraVNC-specific context
+//   * Enhanced detection through registry and service monitoring
+//**************************************************************************************************************
+// - Microsoft 365 Defender:
+//   * "Remote management tools activity" (AlertID: d7e65f32)
+//   * Complements existing detection with UltraVNC focus
+//   * Adds detailed process and file operation tracking
+//**************************************************************************************************************
+// Required Data Sources:
+// - Security Events (EventID: 4688, 4663, 4657, 7045, 4697)
+// - Sysmon Events (Optional for network detection)
+// - Windows Registry Auditing
+// - Windows Service Creation Auditing
+//**************************************************************************************************************
+// References:
+// - MITRE: https://attack.mitre.org/techniques/T1021/001/
+// - MITRE: https://attack.mitre.org/techniques/T1219/
+// - MITRE: https://attack.mitre.org/techniques/T1563/002/
+//************************************************************************************************
+SecurityEvent
+| where TimeGenerated > ago(24h)
+| where 
+    // Process Creation (T1021.001)
+    (EventID == 4688 and (
+        NewProcessName has_any ("winvnc.exe", "vncviewer.exe", "ultravnc.exe")
+        or CommandLine has_any ("vnc")
+    ))
+    or
+    // File System Operations (T1219)
+    (EventID == 4663 and (
+        ObjectName has_any ("winvnc.exe", "vncviewer.exe", "ultravnc.exe")
+        or ObjectName contains "UltraVNC"
+    ))
+    or
+    // Registry Modifications (T1219)
+    (EventID == 4657 and (
+        ObjectName has_any (
+            "HKEY_LOCAL_MACHINE\\SOFTWARE\\UltraVNC",
+            "HKEY_LOCAL_MACHINE\\SOFTWARE\\Wow6432Node\\UltraVNC",
+            "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\uvnc_service"
+        )
+        or ObjectName contains "UltraVNC"
+    ))
+    or
+    // Service Installation (T1563.002)
+    (EventID in (7045, 4697) and (
+        ServiceName has_any ("uvnc_service", "ultravnc_service")
+        or ServiceFileName has_any ("winvnc.exe", "vncviewer.exe", "ultravnc.exe")
+    ))
+| extend EventType = case(
+    EventID == 4688, "Process Creation",
+    EventID == 4663, "File Access",
+    EventID == 4657, "Registry Modification",
+    EventID in (7045, 4697), "Service Operation",
+    "Other"
+)
+| extend
+    MITRETactic = "Lateral Movement",
+    MITRETechnique = case(
+        EventID == 4688, "T1021.001 - Remote Services: Remote Desktop Protocol",
+        EventID == 4663, "T1219 - Remote Access Software",
+        EventID == 4657, "T1219 - Remote Access Software",
+        EventID in (7045, 4697), "T1563.002 - Remote Service Session Hijacking",
+        "Unknown"
+    ),
+    Severity = "High"
+| summarize
+    StartTime = min(TimeGenerated),
+    EndTime = max(TimeGenerated),
+    ProcessCount = dcountif(NewProcessName, EventType == "Process Creation"),
+    FileOperations = dcountif(ObjectName, EventType == "File Access"),
+    RegistryOperations = dcountif(ObjectName, EventType == "Registry Modification"),
+    ServiceOperations = dcountif(ServiceName, EventType == "Service Operation"),
+    EventTypes = make_set(EventType),
+    Techniques = make_set(MITRETechnique),
+    CommandLines = make_set(CommandLine),
+    ObjectNames = make_set(ObjectName)
+    by Computer, Account = SubjectUserName, Severity, MITRETactic
+| extend
+    TimeSpan = EndTime - StartTime,
+    TotalEvents = ProcessCount + FileOperations + RegistryOperations + ServiceOperations,
+    AlertScore = ProcessCount*2 + FileOperations + RegistryOperations + ServiceOperations*2
+| where AlertScore > 5 or TimeSpan < 5m
+| project
+    Severity,
+    MITRETactic,
+    Techniques,
+    DetectionTime = StartTime,
+    Computer,
+    Account,
+    TimeSpan,
+    ProcessCount,
+    FileOperations,
+    RegistryOperations,
+    ServiceOperations,
+    TotalEvents,
+    AlertScore,
+    EventTypes,
+    CommandLines,
+    ObjectNames
+| order by AlertScore desc

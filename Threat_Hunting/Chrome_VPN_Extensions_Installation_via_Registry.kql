@@ -1,0 +1,193 @@
+//*******************************************************************************************************
+// Detection Title: Chrome VPN Extensions Installation via Registry
+//*******************************************************************************************************
+// Description: Detects installation or modification of Chrome VPN extensions through registry changes
+// Status: Test
+// Author: Modified by [Sameer P Sheik]
+// Original Author: frack113
+// Last Updated: 2024-02-13
+//*******************************************************************************************************
+// Severity: Medium
+// The severity is set to medium because:
+// - VPN extensions could be legitimate but also used for proxy avoidance
+// - Potential data exfiltration risk
+// - Possible C2 channel establishment
+//*******************************************************************************************************
+// MITRE ATT&CK Mapping:
+// - Tactic: Defense Evasion (TA0005)
+// - Technique: Proxy (T1090)
+//      - Sub-technique: External Proxy (T1090.002)
+// - Tactic: Command and Control (TA0011)
+// - Technique: Proxy: Multi-hop Proxy (T1090.003)
+//*******************************************************************************************************
+// Validation against Microsoft Sentinel Analytics:
+// 1. Microsoft Defender for Endpoint:
+//    - "Browser extensions making network connections" (AlertID: 0c4a246a-d424-4654-8f12-c88e4d32186c)
+//    - This rule complements MDE by focusing specifically on VPN extensions and registry-based installation
+//*******************************************************************************************************
+// 2. Sentinel Analytics Rules:
+//    - "Multiple web proxy connection attempts" (Template ID: 7ee72a3e-2e54-459c-bc8a-8c08a6532a63)
+//    - This custom rule provides earlier detection at installation time vs. network activity
+//*******************************************************************************************************
+// False Positive Scenarios:
+// 1. Legitimate corporate VPN deployments
+// 2. Developer testing environments
+// 3. Mass software deployment tools
+//*******************************************************************************************************
+// False Positive Reduction:
+// - Validate against approved software deployment tools
+// - Check if extension installation matches corporate VPN solution
+// - Correlate with user behavioral analytics
+//*******************************************************************************************************
+// Response Playbook Recommendations:
+// 1. Validate if VPN extension is approved for corporate use
+// 2. Check user access rights and installation pattern
+// 3. Monitor for subsequent network connections to unknown VPN servers
+// 4. If unauthorized, remove extension and investigate potential data exfiltration
+//*******************************************************************************************************
+// Query to detect Chrome VPN Extensions installation via Registry
+//*******************************************************************************************************
+let VPNExtensions = dynamic([
+    "fdcgdnkidjaadafnichfpabhfomcebme", // ZenMate VPN
+    "fcfhplploccackoneaefokcmbjfbkenj", // 1clickVPN
+    "bihmplhobchoageeokmgbdihknkjbknd", // Touch VPN
+    "gkojfkhlekighikafcpjkiklfbnlmeio", // Hola Free VPN
+    "jajilbjjinjmgcibalaakngmkilboobh", // Astar VPN
+    "gjknjjomckknofjidppipffbpoekiipm", // VPN Free
+    "nabbmpekekjknlbkgpodfndbodhijjem", // Earth VPN
+    "kpiecbcckbofpmkkkdibbllpinceiihk", // DotVPN
+    "nlbejmccbhkncgokjcmghpfloaajcffj", // Hotspot Shield Free VPN
+    "omghfjlpggmjjaagoclmmobgdodcjboh", // Browsec VPN
+    "bibjcjfmgapbfoljiojpipaooddpkpai", // VPN-free.pro
+    "mpcaainmfjjigeicjnlkdfajbioopjko", // VPN Unlimited Free
+    "jljopmgdobloagejpohpldgkiellmfnc", // PP VPN
+    "lochiccbgeohimldjooaakjllnafhaid", // IP Unblock
+    "nhnfcgpcbfclhfafjlooihdfghaeinfc", // Surf VPN
+    "ookhnhpkphagefgdiemllfajmkdkcaim", // iNinja VPN
+    "namfblliamklmeodpcelkokjbffgmeoo", // Daily VPN
+    "nbcojefnccbanplpoffopkoepjmhgdgh", // Hoxx VPN Proxy
+    "majdfhpaihoncoakbjgbdhglocklcgno", // Free VPN
+    "lnfdmdhmfbimhhpaeocncdlhiodoblbd", // VPN PROXY MASTER
+    "eppiocemhmnlbhjplcgkofciiegomcon", // Urban Free VPN
+    "cocfojppfigjeefejbpfmedgjbpchcng", // SaferVPN Proxy
+    "foiopecknacmiihiocgdjgbjokkpkohc", // VPN Professional
+    "hhdobjgopfphlmjbmnpglhfcgppchgje", // AdGuard VPN
+    "jgbaghohigdbgbolncodkdlpenhcmcge", // Free VPN
+    "inligpkjkhbpifecbdjhmdpcfhnlelja", // Free One Touch VPN
+    "higioemojdadgdbhbbbkfbebbdlfjbip", // Unlimited VPN & Proxy by ibVPN
+    "hipncndjamdcmphkgngojegjblibadbe", // RusVPN
+    "iolonopooapdagdemdoaihahlfkncfgg", // Azino VPN
+    "nhfjkakglbnnpkpldhjmpmmfefifedcj", // Pron VPN
+    "jpgljfpmoofbmlieejglhonfofmahini", // Free Residential VPN
+    "fgddmllnllkalaagkghckoinaemmogpe", // ExpressVPN
+    "ejkaocphofnobjdedneohbbiilggdlbi", // Hotspot Shield Elite VPN Proxy
+    "keodbianoliadkoelloecbhllnpiocoi", // Hide My IP VPN
+    "hoapmlpnmpaehilehggglehfdlnoegck", // Tunnello VPN
+    "poeojclicodamonabcabmapamjkkmnnk", // HMA VPN Proxy Unblocker
+    "dfkdflfgjdajbhocmfjolpjbebdkcjog", // Free Avira Phantom VPN
+    "kcdahmgmaagjhocpipbodaokikjkampi", // Hola VPN
+    "klnkiajpmpkkkgpgbogmcgfjhdoljacg", // Free VPN for Chrome
+    "lneaocagcijjdpkcabeanfpdbmapcjjg", // Hub VPN
+    "pgfpignfckbloagkfnamnolkeaecfgfh", // Free Proxy VPN
+    "jplnlifepflhkbkgonidnobkakhmpnmh", // Private Internet Access
+    "jliodmnojccaloajphkingdnpljdhdok", // Turbo VPN for PC
+    "hnmpcagpplmpfojmgmnngilcnanddlhb", // Windscribe
+    "ffbkglfijbcbgblgflchnbphjdllaogb", // CyberGhost VPN
+    "kcndmbbelllkmioekdagahekgimemejo", // VPN.AC
+    "jdgilggpfmjpbodmhndmhojklgfdlhob", // Browser VPN
+    "bihhflimonbpcfagfadcnbbdngpopnjb", // DEEPRISM VPN
+    "ppajinakbfocjfnijggfndbdmjggcmde", // My Browser Vpn
+    "oofgbpoabipfcfjapgnbbjjaenockbdp", // SetupVPN
+    "bhnhkdgoefpmekcgnccpnhjfdgicfebm", // Wachee VPN
+    "knmmpciebaoojcpjjoeonlcjacjopcpf", // Thunder Proxy
+    "dhadilbmmjiooceioladdphemaliiobo", // Free Proxy VPN
+    "jedieiamjmoflcknjdjhpieklepfglin", // FastestVPN Proxy
+    "mhngpdlhojliikfknhfaglpnddniijfh", // WorkingVPN
+    "omdakjcmkglenbhjadbccaookpfjihpa", // TunnelBear VPN
+    "npgimkapccfidfkfoklhpkgmhgfejhbj", // BelkaVPN
+    "akeehkgglkmpapdnanoochpfmeghfdln", // VPN Master
+    "gbmdmipapolaohpinhblmcnpmmlgfgje", // Unblock Websites
+    "aigmfoeogfnljhnofglledbhhfegannp", // Lethean Proxy VPN
+    "cgojmfochfikphincbhokimmmjenhhgk", // Whoer VPN
+    "ficajfeojakddincjafebjmfiefcmanc", // Best VPN USA
+    "ifnaibldjfdmaipaddffmgcmekjhiloa", // FREE VPN DEWELOPMENT
+    "jbnmpdkcfkochpanomnkhnafobppmccn", // apkfold free vpn
+    "apcfdffemoinopelidncddjbhkiblecc", // Soul VPN
+    "mjolnodfokkkaichkcjipfgblbfgojpa", // DotVPN
+    "oifjbnnafapeiknapihcmpeodaeblbkn", // rderzh VPN Proxy
+    "plpmggfglncceinmilojdkiijhmajkjh", // Red Panda VPN
+    "mjnbclmflcpookeapghfhapeffmpodij", // Ultrareach VPN
+    "bblcccknbdbplgmdjnnikffefhdlobhp", // FastStunnel VPN
+    "aojlhgbkmkahabcmcpifbolnoichfeep", // VirtualShield VPN
+    "lcmammnjlbmlbcaniggmlejfjpjagiia", // Adblock Office VPN Proxy Server
+    "knajdeaocbpmfghhmijicidfcmdgbdpm", // Guru VPN & Proxy
+    "bdlcnpceagnkjnjlbbbcepohejbheilk", // Malus VPN
+    "edknjdjielmpdlnllkdmaghlbpnmjmgb", // Muscle VPN
+    "eidnihaadmmancegllknfbliaijfmkgo", // Push VPN
+    "ckiahbcmlmkpfiijecbpflfahoimklke", // Gom VPN
+    "macdlemfnignjhclfcfichcdhiomgjjb", // Free Fast VPN
+    "chioafkonnhbpajpengbalkececleldf", // BullVPN
+    "amnoibeflfphhplmckdbiajkjaoomgnj", // HideAll VPN
+    "llbhddikeonkpbhpncnhialfbpnilcnc", // ProxyFlow
+    "pcienlhnoficegnepejpfiklggkioccm", // Cloud VPN
+    "iocnglnmfkgfedpcemdflhkchokkfeii", // sVPN
+    "igahhbkcppaollcjeaaoapkijbnphfhb", // Social VPN
+    "njpmifchgidinihmijhcfpbdmglecdlb", // Trellonet Trellonet
+    "ggackgngljinccllcmbgnpgpllcjepgc", // WindmillVPN
+    "kchocjcihdgkoplngjemhpplmmloanja", // IPBurger Proxy & VPN
+    "bnijmipndnicefcdbhgcjoognndbgkep", // Veee
+    "lklekjodgannjcccdlbicoamibgbdnmi", // Anonymous Proxy Vpn Browser
+    "dbdbnchagbkhknegmhgikkleoogjcfge", // Hideman VPN
+    "egblhcjfjmbjajhjhpmnlekffgaemgfh", // Fornex VPN
+    "ehbhfpfdkmhcpaehaooegfdflljcnfec", // WeVPN
+    "bkkgdjpomdnfemhhkalfkogckjdkcjkg", // VPNMatic
+    "almalgbpmcfpdaopimbdchdliminoign", // Urban Shield
+    "akkbkhnikoeojlhiiomohpdnkhbkhieh", // Prime VPN
+    "gbfgfbopcfokdpkdigfmoeaajfmpkbnh", // westwind
+    "bniikohfmajhdcffljgfeiklcbgffppl", // Upnet
+    "lejgfmmlngaigdmmikblappdafcmkndb", // uVPN
+    "ffhhkmlgedgcliajaedapkdfigdobcif", // Nucleus VPN
+    "gcknhkkoolaabfmlnjonogaaifnjlfnp", // FoxyProxy Standard
+    "pooljnboifbodgifngpppfklhifechoe", // GeoProxy
+    "fjoaledfpmneenckfbpdfhkmimnjocfa", // NordVPN
+    "aakchaleigkohafkfjfjbblobjifikek", // ProxFlow
+    "dpplabbmogkhghncfbfdeeokoefdjegm", // Proxy SwitchySharp
+    "padekgcemlokbadohgkifijomclgjgif", // Proxy SwitchyOmega
+    "bfidboloedlamgdmenmlbipfnccokknp"  // PureVPN
+]);
+//
+// Query using Windows Security Events (Event ID 4657)
+SecurityEvent
+| where EventID == 4657  // Registry value modified
+| where ObjectName contains "Software\\Wow6432Node\\Google\\Chrome\\Extensions"
+| where ObjectName endswith "update_url"
+| where ObjectName has_any (VPNExtensions)
+| project 
+    TimeGenerated,
+    Computer,
+    ObjectName,
+    OldValue,
+    NewValue,
+    Account,
+    Activity,
+    SubjectAccount
+| extend ExtensionId = tostring(extract(@"Extensions\\([^\\]+)", 1, ObjectName))
+| extend VPNName = case(
+    ExtensionId == "fdcgdnkidjaadafnichfpabhfomcebme", "ZenMate VPN",
+    ExtensionId == "fcfhplploccackoneaefokcmbjfbkenj", "1clickVPN",
+    ExtensionId == "bihmplhobchoageeokmgbdihknkjbknd", "Touch VPN",
+    ExtensionId == "gkojfkhlekighikafcpjkiklfbnlmeio", "Hola Free VPN",
+    "Unknown VPN"
+)
+| project-reorder 
+    TimeGenerated,
+    Computer,
+    VPNName,
+    ExtensionId,
+    ObjectName,
+    NewValue,
+    OldValue,
+    Account,
+    SubjectAccount,
+    Activity
+| order by TimeGenerated desc

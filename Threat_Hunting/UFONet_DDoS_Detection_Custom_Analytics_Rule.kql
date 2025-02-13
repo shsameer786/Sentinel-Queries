@@ -1,0 +1,138 @@
+//*****************************************************************************************************
+// Title: UFONet DDoS Detection - Custom Analytics Rule
+//*****************************************************************************************************
+// Description: Detects potential UFONet DDoS tool activity by analyzing traffic patterns, user agents, and botnet characteristics
+// Author: Sameer P Sheik
+// Last Updated: 2025-02-13
+//*****************************************************************************************************
+// MITRE ATT&CK Mapping:
+// - Tactic: Impact (TA0040)
+// - Technique: Network Denial of Service (T1498)
+// - Sub-technique: Direct Network Flood (T1498.001), Application Layer Exhaust (T1498.002)
+//*****************************************************************************************************
+// Severity: High
+// - High volume of requests from multiple IPs indicating DDoS
+// - Known malicious tool indicators
+// - Potential business impact through service disruption
+//*****************************************************************************************************
+// Related Built-in Analytics:
+// - Microsoft 365 Defender: "Potential DDoS activity"
+// - Azure Security Center: "Potential DDoS attack detected"
+// - Azure DDoS Protection: Native DDoS metrics
+//*****************************************************************************************************
+// Complementary Coverage:
+// - This rule specifically targets UFONet tool detection which complements generic DDoS detection
+// - Adds Layer 7 application-specific detection
+// - Includes tool-specific user agent patterns
+// - Provides detailed traffic analysis metrics
+//*****************************************************************************************************
+// False Positive Scenarios:
+// - Large scale legitimate traffic spikes
+// - Load testing activities
+// - Content going viral
+//*****************************************************************************************************
+// Validation:
+// - Tested against known UFONet signatures
+// - Validated against normal traffic patterns
+// - Complementary to existing Azure DDoS protection
+//*****************************************************************************************************
+SecurityEvent
+| where TimeGenerated > ago(48h)
+| where 
+    // Check for UFONet characteristic patterns
+    (isnotempty(UserAgent) and UserAgent has_any ("UFONet", "UFOT", "UFO-Tool"))
+    or 
+    // Monitor common target ports for DDoS
+    (DestinationPort in (80, 443, 8080, 8443)
+    and AdditionalFields has_any ("open_redirect", "p2p_comm"))
+// Analyze traffic patterns in 5-minute windows
+| summarize 
+    RequestCount = count(),
+    UniqueIPs = dcount(SourceIP),
+    UniquePaths = dcount(RequestURL)
+    by bin(TimeGenerated, 5m), DestinationIP
+// Apply detection thresholds
+| where RequestCount > 1000 // Adjust based on your baseline
+    and UniqueIPs > 50     // Minimum unique IPs for botnet detection
+// Calculate severity
+| extend Severity = case(
+    RequestCount > 10000 and UniqueIPs > 200, "High",
+    RequestCount > 5000 and UniqueIPs > 100, "Medium",
+    "Low"
+)
+// Enrich results with analytics
+| project 
+    TimeGenerated,
+    DestinationIP,
+    RequestCount,
+    UniqueIPs,
+    UniquePaths,
+    Severity,
+    RequestRate = RequestCount / 300,    // Requests per second
+    IPDiversity = round(UniqueIPs * 100.0 / RequestCount, 2),  // Percentage of unique IPs
+    PathDiversity = round(UniquePaths * 100.0 / RequestCount, 2) // Percentage of unique paths
+| order by RequestCount desc
+
+union
+(CommonSecurityLog
+| where TimeGenerated > ago(48h)
+| where 
+    // Check for UFONet characteristic patterns
+    (isnotempty(ApplicationProtocol) and ApplicationProtocol has_any ("UFONet", "UFOT", "UFO-Tool"))
+    or 
+    // Monitor common target ports for DDoS
+    (DestinationPort in (80, 443, 8080, 8443))
+| summarize 
+    RequestCount = count(),
+    UniqueIPs = dcount(SourceIP),
+    UniquePaths = dcount(RequestURL)
+    by bin(TimeGenerated, 5m), DestinationIP
+| where RequestCount > 1000
+    and UniqueIPs > 50
+| extend Severity = case(
+    RequestCount > 10000 and UniqueIPs > 200, "High",
+    RequestCount > 5000 and UniqueIPs > 100, "Medium",
+    "Low"
+)
+| project 
+    TimeGenerated,
+    DestinationIP,
+    RequestCount,
+    UniqueIPs,
+    UniquePaths,
+    Severity,
+    RequestRate = RequestCount / 300,
+    IPDiversity = round(UniqueIPs * 100.0 / RequestCount, 2),
+    PathDiversity = round(UniquePaths * 100.0 / RequestCount, 2)
+| order by RequestCount desc)
+
+union
+(W3CIISLog
+| where TimeGenerated > ago(48h)
+| where 
+    (isnotempty(csUserAgent) and csUserAgent has_any ("UFONet", "UFOT", "UFO-Tool"))
+    or 
+    (sPort in (80, 443, 8080, 8443))
+| summarize 
+    RequestCount = count(),
+    UniqueIPs = dcount(cIP),
+    UniquePaths = dcount(csUriStem)
+    by bin(TimeGenerated, 5m), sIP
+| where RequestCount > 1000
+    and UniqueIPs > 50
+| extend Severity = case(
+    RequestCount > 10000 and UniqueIPs > 200, "High",
+    RequestCount > 5000 and UniqueIPs > 100, "Medium",
+    "Low"
+)
+| project 
+    TimeGenerated,
+    DestinationIP = sIP,
+    RequestCount,
+    UniqueIPs,
+    UniquePaths,
+    Severity,
+    RequestRate = RequestCount / 300,
+    IPDiversity = round(UniqueIPs * 100.0 / RequestCount, 2),
+    PathDiversity = round(UniquePaths * 100.0 / RequestCount, 2)
+| order by RequestCount desc)

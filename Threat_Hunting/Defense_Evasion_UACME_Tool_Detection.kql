@@ -1,0 +1,117 @@
+//**************************************************************************************************************
+// Query Name: Custom - Defense Evasion - UACME Tool Detection
+// Version: 1.0
+// Created: 2025-02-13
+// Author: Sameer P Sheik
+//**************************************************************************************************************
+// Description: 
+//**************************************************************************************************************
+// This detection identifies potential UAC bypass attempts using UACME toolkit by monitoring 
+// process creation events with specific focus on known UACME techniques and behaviors.
+//**************************************************************************************************************
+// MITRE ATT&CK Mapping:
+// - Tactic: Defense Evasion (TA0005)
+// - Technique: Bypass User Account Control (T1548.002)
+// - Sub-technique: UAC Bypass using AutoElevate
+//**************************************************************************************************************
+// Severity: High
+// - Impact: Critical - Successful execution leads to privilege escalation
+// - Probability: Medium - Requires specific conditions and known processes
+//**************************************************************************************************************
+// False Positive Scenarios:
+// - Legitimate system maintenance activities
+// - Administrative tools running from non-standard locations
+// - Software installation processes
+//**************************************************************************************************************
+// Validation Against OOB Analytics:
+// 1. Microsoft Defender for Endpoint:
+//    - Complements "UAC Bypass Attempt" (AlertID: ba2b4ca6-d002-4ac7-9c71-36e9bbf1e412)
+//    - Extends "Suspicious elevation of privilege attempt" detection
+//**************************************************************************************************************
+// 2. Microsoft Sentinel:
+//    - Enhances "UAC Bypass Using AutoElevate" analytics rule
+//    - Provides additional context beyond basic process monitoring
+//**************************************************************************************************************
+// 3. Coverage Gaps Addressed:
+//    - Custom process lineage validation
+//    - Enhanced risk scoring based on multiple factors
+//    - Specific UACME toolkit detection patterns
+//    - Location-based analysis
+//**************************************************************************************************************
+// Alert Triage Steps:
+// 1. Validate process execution context and integrity level transitions
+// 2. Review parent-child process relationships
+// 3. Check for associated registry modifications
+// 4. Examine user context and previous activity
+//**************************************************************************************************************
+let timeframe = 24h;
+let UACMEProcesses = pack_array(
+    "RunLegacyCPLElevated.exe",
+    "Sysprep.exe",
+    "consent.exe",
+    "osk.exe",
+    "msconfig.exe",
+    "fodhelper.exe",
+    "computerdefaults.exe"
+);
+let SuspiciousLocations = pack_array(
+    @"C:\\Users\\.*\\AppData\\Local\\Temp\\.*",
+    @"C:\\Windows\\Temp\\.*",
+    @"C:\\ProgramData\\.*"
+);
+DeviceProcessEvents
+| where Timestamp > ago(timeframe)
+// Look for known UACME process names
+| where FileName has_any (UACMEProcesses)
+// Check for suspicious process lineage
+| where InitiatingProcessFileName !~ "explorer.exe" 
+    and InitiatingProcessFileName !endswith "cmd.exe"
+    and InitiatingProcessFileName !endswith "powershell.exe"
+// Look for processes running from suspicious locations
+| where FolderPath matches regex strcat('(', strcat_array(SuspiciousLocations, '|'), ')')
+// Check for process elevation
+| where ProcessIntegrityLevel == "High"
+// Additional context for investigation
+| extend LaunchCommand = ProcessCommandLine
+| extend ParentProcess = InitiatingProcessFileName
+| extend ParentCommand = InitiatingProcessCommandLine
+| extend AccountName = AccountName
+| extend DeviceName = DeviceName
+| extend TimeGenerated = Timestamp
+// Calculate risk score based on multiple factors
+| extend RiskScore = case(
+    ProcessCommandLine contains "autoelevate", 90,
+    ProcessCommandLine contains "runas", 80,
+    InitiatingProcessIntegrityLevel == "Medium" and ProcessIntegrityLevel == "High", 70,
+    50)
+// Add MITRE ATT&CK and detection context
+| extend DetectionContext = pack(
+    "AlertName", "UACME Tool Activity Detected",
+    "AlertType", "SecurityAlert",
+    "Severity", "High",
+    "Category", "PrivilegeEscalation",
+    "ThreatName", "UACME-UAC-Bypass",
+    "MITRE_Tactic", "Defense Evasion",
+    "MITRE_TechniqueID", "T1548.002",
+    "MITRE_Technique", "Bypass User Account Control",
+    "MITRE_SubTechnique", "UAC Bypass using AutoElevate",
+    "RiskScore", RiskScore,
+    "ThreatDescription", "Potential UAC bypass attempt using UACME toolkit detected",
+    "RecommendedAction", "1. Isolate affected system\n2. Investigate process execution chain\n3. Check for additional compromise indicators\n4. Review user authentication logs",
+    "RemediationSteps", "1. Terminate suspicious processes\n2. Remove unauthorized files\n3. Reset affected user accounts\n4. Update UAC settings"
+)
+// Project relevant fields for analysis
+| project-reorder
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    FileName,
+    LaunchCommand,
+    ParentProcess,
+    ParentCommand,
+    ProcessIntegrityLevel,
+    InitiatingProcessIntegrityLevel,
+    RiskScore,
+    DetectionContext,
+    FolderPath
+| sort by RiskScore desc, TimeGenerated desc
