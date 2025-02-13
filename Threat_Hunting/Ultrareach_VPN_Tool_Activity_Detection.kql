@@ -1,0 +1,179 @@
+//****************************************************************************************************************
+//////////////////////////////////////////////////////////////////////////////////////////////////
+// Detection Name: Ultrareach VPN Tool Activity Detection
+// Author: Sameer P Sheik
+// Date: 2024-02-13
+// Version: 1.0
+//////////////////////////////////////////////////////////////////////////////////////////////////
+//****************************************************************************************************************
+// DESCRIPTION
+// This detection identifies potential Ultrareach VPN tool usage through its Chrome extension identifier
+// and related artifacts across process, network, registry, and file activities.
+//****************************************************************************************************************
+// SEVERITY: Medium
+// - Impact: Potential evasion of network controls and monitoring
+// - False Positive Rate: Low to Medium
+// - Performance Impact: Low
+//****************************************************************************************************************
+// MITRE ATT&CK MAPPING
+// - Tactic: Command and Control (TA0011)
+// - Technique: Multi-hop Proxy (T1090.003)
+// - Sub-technique: VPN (T1090.003)
+//****************************************************************************************************************
+// RELATED TECHNIQUES
+// - Defense Evasion (TA0005)
+// - Proxy (T1090)
+// - Protocol Tunneling (T1572)
+//****************************************************************************************************************
+// VALIDATION AGAINST EXISTING DETECTIONS
+// - Complementary to MDE built-in 'Suspicious VPN Usage' alert
+// - Extends 'Anonymous Communication Tool' detection
+// - Provides specific coverage for Ultrareach VPN not covered by default rules
+//****************************************************************************************************************
+// FALSE POSITIVE SCENARIOS
+// - Legitimate corporate VPN usage
+// - Network security testing activities
+// - Security research activities
+//****************************************************************************************************************
+// TRUE POSITIVE VALIDATION
+// - Confirmed extension ID matches Ultrareach VPN signature
+// - Multiple event types (process, network, registry, file) correlation
+// - Non-standard installation paths or execution patterns
+//****************************************************************************************************************
+// SUGGESTED RESPONSE ACTIONS
+// 1. Validate against approved VPN software inventory
+// 2. Check user's group membership and VPN usage permissions
+// 3. Review associated network connections and destinations
+// 4. Examine process lineage and installation source
+//****************************************************************************************************************
+let timeframe = 24h;
+let regex_pattern = @"mjnbclmflcpookeapghfhapeffmpodij";
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(timeframe)
+    | where 
+        ProcessCommandLine contains regex_pattern or
+        InitiatingProcessCommandLine contains regex_pattern
+    | extend DetectionSource = "Process"
+    | project
+        Timestamp,
+        DeviceName,
+        ProcessId,
+        ProcessCommandLine,
+        InitiatingProcessCommandLine,
+        InitiatingProcessId,
+        InitiatingProcessFileName,
+        FolderPath,
+        DetectionSource
+)
+// Union with network events
+| union (
+    DeviceNetworkEvents
+    | where Timestamp > ago(timeframe)
+    | where 
+        RemoteUrl contains regex_pattern or
+        InitiatingProcessCommandLine contains regex_pattern
+    | extend DetectionSource = "Network"
+    | project
+        Timestamp,
+        DeviceName,
+        InitiatingProcessId,
+        InitiatingProcessCommandLine,
+        RemoteIP,
+        RemotePort,
+        RemoteUrl,
+        LocalIP,
+        LocalPort,
+        DetectionSource
+)
+// Union with registry events
+| union (
+    DeviceRegistryEvents
+    | where Timestamp > ago(timeframe)
+    | where 
+        RegistryValueData contains regex_pattern or
+        PreviousRegistryValueData contains regex_pattern
+    | extend DetectionSource = "Registry"
+    | project
+        Timestamp,
+        DeviceName,
+        InitiatingProcessId,
+        InitiatingProcessCommandLine,
+        RegistryKey,
+        RegistryValueData,
+        PreviousRegistryValueData,
+        DetectionSource
+)
+// Union with file events
+| union (
+    DeviceFileEvents
+    | where Timestamp > ago(timeframe)
+    | where 
+        FileName contains regex_pattern or
+        FolderPath contains regex_pattern or
+        SHA256 contains regex_pattern
+    | extend DetectionSource = "File"
+    | project
+        Timestamp,
+        DeviceName,
+        InitiatingProcessId,
+        InitiatingProcessCommandLine,
+        FileName,
+        FolderPath,
+        SHA256,
+        DetectionSource
+)
+// Add severity and custom fields
+| extend 
+    DetectionType = "VPN Tool Detection",
+    Severity = "Medium",
+    ThreatCategory = "Greyware",
+    ToolName = "Ultrareach VPN"
+// Add custom alert context
+| extend
+    AlertContext = pack(
+        "DetectionPattern", regex_pattern,
+        "DetectionType", DetectionType,
+        "ThreatCategory", ThreatCategory,
+        "ToolName", ToolName,
+        "DetectionSource", DetectionSource,
+        "TimeDetected", Timestamp
+    )
+// Add relevant MITRE ATT&CK context
+| extend
+    MITRECategory = "Command and Control",
+    MITRETechnique = "Proxy: Multi-hop Proxy",
+    MITRETechniqueID = "T1090.003"
+// Final projection of important fields
+| project
+    Timestamp,
+    DeviceName,
+    DetectionType,
+    Severity,
+    ThreatCategory,
+    ToolName,
+    DetectionSource,
+    AlertContext,
+    MITRECategory,
+    MITRETechnique,
+    MITRETechniqueID
+| sort by Timestamp desc
+//****************************************************************************************************************
+// Investigation Tips:
+// 1. Correlate with DeviceNetworkEvents to identify external connections
+// 2. Check for related Chrome extension installations in Registry
+// 3. Review process timeline for installation source
+// 4. Examine user login history and locations
+//****************************************************************************************************************
+// Enrichment Suggestions:
+// 1. Add GeoIP lookup for network connections
+// 2. Include user risk scoring if available
+// 3. Add device sensitivity classification
+// 4. Incorporate threat intelligence for known VPN exit nodes
+//****************************************************************************************************************
+// Maintenance Notes:
+// - Review and update regex pattern quarterly
+// - Monitor false positive rate and adjust severity mapping
+// - Update MITRE mappings as techniques evolve
+// - Validate against new Chrome extension versions
+//****************************************************************************************************************
