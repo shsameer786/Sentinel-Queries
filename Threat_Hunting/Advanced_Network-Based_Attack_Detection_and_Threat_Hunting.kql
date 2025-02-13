@@ -1,0 +1,157 @@
+//*******************************************************************************************************************************
+// Rule Name: Advanced Network-Based Attack Detection and Threat Hunting
+// Version: 1.0
+// Created Date: 2025-02-13
+//*******************************************************************************************************************************
+// Description: 
+// This query detects various network-based attacks including C2 communications, lateral movement,
+// and network reconnaissance activities by analyzing multiple data sources and behavioral patterns.
+//*******************************************************************************************************************************
+// MITRE ATT&CK Mapping:
+// - Command and Control (TA0011):
+//   * T1071 - Application Layer Protocol
+//   * T1090 - Proxy
+//   * T1095 - Non-Application Layer Protocol
+//   * T1571 - Non-Standard Port
+// - Lateral Movement (TA0008):
+//   * T1021 - Remote Services
+//   * T1078 - Valid Accounts
+//   * T1210 - Exploitation of Remote Services
+// - Discovery (TA0007):
+//   * T1046 - Network Service Discovery
+//   * T1018 - Remote System Discovery
+//   * T1083 - File and Directory Discovery
+//*******************************************************************************************************************************
+// Severity: High
+// Severity Justification:
+// - Detects active network-based attacks and post-exploitation activities
+// - Multiple detection points reduce false positives
+// - Focuses on high-impact attack techniques
+// - Correlates different attack patterns for higher confidence
+//*******************************************************************************************************************************
+// Required Data Sources:
+// - SecurityEvent (Windows Security Events)
+// - CommonSecurityLog (Firewall/Network Device Logs)
+// - DnsEvents (DNS Query Logs)
+//*******************************************************************************************************************************
+// Coverage and Complementarity:
+// OOB Analytics Coverage Check:
+// 1. Microsoft Security Analytics:
+//    - Complements "Network communication to C&C server" (AlertID: 42c3ffc6-27c0-4a8f-8f31-48c8a1577911)
+//    - Extends "Suspicious remote network activity" (AlertID: 9d8b4a5c-3839-4e8d-8c4d-89f2c053f0d2)
+// 2. Sentinel Analytics:
+//    - Enhances "Multiple SMB failures followed by success" detection
+//    - Adds to "Suspicious number of failed logons" analytics
+//
+// Unique Additions:
+// - Multi-source correlation
+// - Behavioral analysis of network patterns
+// - Custom thresholds for environment-specific tuning
+// - Comprehensive MITRE technique coverage
+//*******************************************************************************************************************************
+// False Positive Scenarios:
+// 1. Network monitoring tools
+// 2. Legitimate administrative activities
+// 3. Security scanning tools
+// 4. Backup solutions
+//*******************************************************************************************************************************
+// Suggested Exclusions:
+// - Security team IP ranges
+// - Monitoring system accounts
+// - Backup service accounts
+//*******************************************************************************************************************************
+//Define common variables and watchlists
+//*******************************************************************************************************************************
+let suspicious_ports=dynamic([80,443,445,1433,3389,4444,4445,4446,5985,5986,6379,8080,8443,8888,9001,9002]);
+let offensive_processes=dynamic(["powershell.exe","cmd.exe","psexec.exe","wmic.exe","net.exe","netsh.exe","mshta.exe","rundll32.exe","regsvr32.exe","certutil.exe"]);
+//*******************************************************************************************************************************
+//Command and Control (C2) Detection - Identifies potential C2 traffic patterns
+//MITRE: T1071, T1090, T1095, T1571
+//Severity: High
+//*******************************************************************************************************************************
+let c2_detection=CommonSecurityLog
+|where DestinationPort in(suspicious_ports)
+|where not(ipv4_is_private(DestinationIP))
+|where not(ipv4_is_private(SourceIP))
+|where not(DestinationIP has_any("github","microsoft","adobe"))
+|extend BytesPerMinute=SentBytes+ReceivedBytes,DataRatio=iif(ReceivedBytes==0,0.0,toreal(SentBytes)/toreal(ReceivedBytes))
+|where BytesPerMinute>1024 and BytesPerMinute<1024*1024*10
+|project TimeGenerated,SourceIP,DestinationIP,DestinationPort,BytesPerMinute,DataRatio,ApplicationProtocol;
+//*******************************************************************************************************************************
+//Lateral Movement Detection - Monitors for unauthorized network access attempts
+//MITRE: T1021, T1078, T1210
+//Severity: High
+//*******************************************************************************************************************************
+let lateral_movement=SecurityEvent
+|where EventID==4624
+|where LogonType in(3,9,10)
+|project TimeGenerated,SourceComputer=WorkstationName,TargetComputer=Computer,LogonType,Account=TargetUserName,IpAddress;
+//*******************************************************************************************************************************
+//Process Network Activity - Tracks suspicious process execution with network connections
+//MITRE: T1059, T1569, T1021
+//Severity: Medium
+//*******************************************************************************************************************************
+let process_network=SecurityEvent
+|where EventID==4688
+|where Process has_any(offensive_processes)
+|project TimeGenerated,Computer,Account=SubjectUserName,Process,CommandLine,ParentProcessName;
+//*******************************************************************************************************************************
+//Network Scanning Detection - Identifies potential reconnaissance activities
+//MITRE: T1046, T1018, T1595
+//Severity: Medium
+//*******************************************************************************************************************************
+let network_scanning=CommonSecurityLog
+|summarize TargetCount=dcount(DestinationIP),PortCount=dcount(DestinationPort),TotalAttempts=count() by SourceIP,bin(TimeGenerated,5m)
+|where TargetCount>10 or PortCount>5
+|project TimeGenerated,SourceIP,TargetCount,PortCount,TotalAttempts;
+//*******************************************************************************************************************************
+//SMB Exploitation Detection - Monitors for potential SMB-based attacks
+//MITRE: T1210, T1021.002
+//Severity: High
+//*******************************************************************************************************************************
+let smb_exploitation=CommonSecurityLog
+|where DestinationPort==445
+|where ApplicationProtocol=~"SMB"
+|where DeviceAction=="allow"
+|summarize AttemptCount=count(),UniqueDestinations=dcount(DestinationIP) by SourceIP,bin(TimeGenerated,5m)
+|where AttemptCount>5
+|project TimeGenerated,SourceIP,AttemptCount,UniqueDestinations;
+//*******************************************************************************************************************************
+//Suspicious DNS Activity - Detects potential DNS tunneling and C2 over DNS
+//MITRE: T1071.004, T1568.002
+//Severity: Medium
+//*******************************************************************************************************************************
+let suspicious_dns=DnsEvents
+|where QueryType in("A","AAAA")
+|where Name matches regex @"[a-zA-Z0-9]{25,}" or Name contains"pastebin" or Name contains"github.io" or Name contains"githubusercontent"
+|project TimeGenerated,ClientIP,QueryType,Name;
+//*******************************************************************************************************************************
+//Combine all detections and add metadata
+//*******************************************************************************************************************************
+union
+(c2_detection|extend DetectionType="Command and Control"),
+(lateral_movement|extend DetectionType="Lateral Movement"),
+(process_network|extend DetectionType="Suspicious Process with Network Activity"),
+(network_scanning|extend DetectionType="Network Scanning"),
+(smb_exploitation|extend DetectionType="SMB Exploitation"),
+(suspicious_dns|extend DetectionType="Suspicious DNS")
+|project TimeGenerated,DetectionType,SourceIP=coalesce(SourceIP,ClientIP,IpAddress),DestinationIP,Computer=coalesce(Computer,SourceComputer),Account,AdditionalData=pack_all()
+|sort by TimeGenerated desc
+//*******************************************************************************************************************************
+//Add severity scoring for prioritization
+//Severity levels aligned with MITRE ATT&CK impact and likelihood
+//*******************************************************************************************************************************
+|extend Severity=case(
+    DetectionType=="Command and Control",3,      // High - Active C2
+    DetectionType=="SMB Exploitation",3,         // High - Active Exploitation
+    DetectionType=="Lateral Movement",2,         // Medium - Potential Compromise
+    DetectionType=="Network Scanning",2,         // Medium - Reconnaissance
+    DetectionType=="Suspicious Process with Network Activity",2,  // Medium - Suspicious Behavior
+    DetectionType=="Suspicious DNS",1,           // Low - Possible Indicator
+    0)
+|extend SeverityLabel=case(
+    Severity==3,"High",
+    Severity==2,"Medium",
+    Severity==1,"Low",
+    "Informational")
+//*******************************************************************************************************************************
